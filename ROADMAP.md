@@ -1,38 +1,74 @@
 # Roadmap
 
-Phased to derisk the hardest pieces first (SMS dedup correctness, default-SMS-app handoff, Play Store gating). Each phase has a working, demoable artifact.
+Per the user's scope decisions during the no-PC-transfer plan: v1 holds release until **all five categories work end-to-end** (read, dedup, write) on Android↔Android. iOS is Phase 3.
 
-## Phase 0 — Scaffold (current)
+## Phase 0 — Scaffold
 
 - [x] Project directory + planning docs
 - [x] Flutter + Dart app scaffolded under `app/`
-- [x] Android module skeleton (Kotlin) wired to a stub `MethodChannel` bridge
+- [x] Android module skeleton (Kotlin) wired via `MethodChannel`
 - [x] iOS module skeleton (Swift) — placeholder `ios/Runner/native/ContactsChannel.swift`; full implementation deferred until a Mac is available
 
-## Phase 1 — Android-only SMS dedup proof-of-concept
+## v1 — Android↔Android, all five categories, no PC
 
-The product's hardest correctness problem first.
+Subdivided into tracks that can land in parallel. Each track has a "code complete" gate that requires no real-device testing, and a "validated" gate that does.
 
-- [x] `SmsChannel.kt`: read SMS via `content://sms`, emit normalized records
-- [x] `lib/core/dedup/sms_dedup.dart`: composite-hash matcher; unit tests with synthetic dupes (timestamp jitter, body whitespace, address formatting)
-- [x] `lib/core/io/sms_backup_xml.dart`: parser for SMS Backup & Restore XML exports (sms + mms with content-hashed parts)
-- [x] CLI harness (`tool/sms_diff.dart`) that takes two XML exports and reports the dedup diff — `dart run tool/sms_diff.dart -s A.xml -t B.xml`
-- [ ] Validation set: real 5k+ SMS export from the user's S23 vs. Pixel 7 baseline; manually spot-check matches
-- [ ] Default-SMS-app handoff flow: write a small set of new messages back, verify thread integrity in Google Messages
+### Track A — Transport
 
-**Exit criterion:** zero false positives on the validation set; <1% false negatives explained by genuine carrier resends.
+- [x] `Transport` / `PairedSession` / `DiscoveredPeer` interfaces (`app/lib/core/transfer/transport.dart`)
+- [x] `InMemoryTransport` for unit tests
+- [x] `FrameCodec` (length-prefixed wire framing)
+- [x] `CategoryWal` (per-category resumability)
+- [x] `Handshake` (X25519 + HKDF + PIN-derived key material)
+- [ ] **USB-C spike** (`docs/usb-c-spike.md`) — pass/fail in 5 working days
+- [ ] `WifiDirectTransport` + `WifiDirectChannel.kt` (Android `WifiP2pManager`)
+- [ ] `MdnsTransport` (`multicast_dns` pub package)
+- [ ] `UsbTransport` + `UsbChannel.kt` — gated on spike
+- [ ] `TransferForegroundService.kt` (so backgrounded transfers survive)
+- [ ] Wire pair/scan/transfer screens to a real `PairedSession`
+- [ ] AES-GCM seal frames using handshake-derived key
 
-## Phase 2 — Android↔Android end-to-end
+### Track B — Per-category readers / writers / dedup matchers
 
-- [ ] mDNS pairing + PIN + TLS-PSK channel
-- [ ] Manifest-then-payload streaming protocol
-- [ ] Call log dedup (much simpler than SMS — should land in days)
-- [ ] Photos: hash-only dedup first, perceptual second
-- [ ] Contacts: read/write + delegation pointer to Google Contacts merge for synced contacts
-- [ ] Calendar
-- [ ] Transfer UI with per-category progress and resume
+Read + count are wired (Select screen shows live counts on real hardware).
+Dedup matchers are pure-Dart and unit-tested. Writers are the missing piece per category.
 
-**Exit criterion:** S23 → Pixel 7 round trip on the user's actual data, completing without duplicates.
+- [x] **SMS** read + count + dedup matcher + XML-parser CLI harness (`tool/sms_diff.dart`)
+- [x] **Call log** count + dedup matcher
+- [x] **Contacts** count + dedup matcher (multi-key + confidence)
+- [x] **Photos/videos** count + size estimate + sha256+pHash matcher
+- [x] **Calendar** count + dedup matcher (UID + composite fallback)
+- [x] Multi-category CLI harness (`tool/dedup_diff.dart`) — JSON in, dedup report out
+- [ ] SMS writer (default-SMS-app role grab/release dance)
+- [ ] Call log writer (`CallLog.Calls.CONTENT_URI` insert + `WRITE_CALL_LOG`)
+- [ ] Contacts writer (`ContactsContract` raw-contact insert)
+- [ ] Photos writer (MediaStore insert with original timestamps)
+- [ ] Calendar writer (`CalendarContract.Events` insert)
+- [ ] Real readers (currently only count is implemented for the four new categories)
+
+### Track C — UX
+
+- [x] Pair / Select / Scan / Transfer / Done screens (with stubbed transport)
+- [x] Per-category Select screen with live counts, byte estimates, "Tap to allow" inline permission CTAs, "Select all" toggle, running-total CTA
+- [x] Conflict review screen (Contacts + Photos pHash) with three-way Keep both / Keep this / Use source
+- [ ] Pair screen rewired to use `Transport` factory (probe Wi-Fi Direct, fall back to mDNS, surface USB-C if available)
+- [ ] Scan screen rewired to stream the real per-category dedup diff
+- [ ] Transfer screen rewired to stream foreground-service progress events
+- [ ] Default-SMS-app role grab onboarding (in-app explainer before the system dialog)
+
+### Validation gates (real device pair required)
+
+- [ ] SMS validation set: 5k+ messages from user's S23 vs Pixel baseline; zero false-positive dedup; <1% false-negatives
+- [ ] Real-device pair test on Wi-Fi Direct (S23 ↔ Pixel 7)
+- [ ] Same on mDNS fallback (mobile data off, both on home Wi-Fi)
+- [ ] Wrong-PIN reject test
+- [ ] Drop-and-resume test (Wi-Fi off for 10s during transfer; verify WAL replay)
+- [ ] Background test (foreground-service notification + transfer continues)
+- [ ] OEM matrix: Samsung + Pixel + one MIUI device
+- [ ] End-to-end round trip with all five categories selected
+- [ ] Reverse round trip — should be all dedups, zero new transfers
+
+**Exit criterion:** S23 → Pixel 7 round trip on the user's actual data, completing without duplicates across all five categories.
 
 ## Phase 3 — iOS as source
 
@@ -53,4 +89,5 @@ Reduced scope due to platform constraints (no SMS, no call log).
 - WhatsApp / Signal chat merge (technically infeasible without root).
 - Cloud relay (privacy stance).
 - Restoring app settings (sandboxed).
-- Backwards-compat with proprietary Smart Switch / Switch to Android backup formats — complexity sink, not the value proposition.
+- Backwards-compat with proprietary Smart Switch / Switch to Android backup formats.
+- Google Nearby Connections (Play-Services dependency is off-brand for the no-cloud stance).

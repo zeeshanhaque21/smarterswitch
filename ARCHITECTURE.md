@@ -49,7 +49,7 @@ The product's feasible surface is defined by what each OS lets a third-party app
 └─────────────────────────┘         └─────────────────────────┘
 ```
 
-**No cloud relay.** Pairing happens on the same Wi-Fi via mDNS + a one-time PIN; transfer is TLS with cert pinning to the paired peer. No account, no telemetry.
+**No cloud relay.** Two phones pair on whatever local link is fastest available — Wi-Fi Direct primarily, same-LAN mDNS as fallback, USB-C if the spike clears (`docs/usb-c-spike.md`). All paths use the same 6-digit PIN handshake; transfer rides AES-GCM on top of a key derived from the PIN. No account, no telemetry.
 
 ## Modules
 
@@ -67,9 +67,20 @@ Dedup runs **on the target**, after streaming the source's hash manifest first. 
 
 ### `core/transfer`
 
-- mDNS service `_smarterswitch._tcp` for peer discovery.
-- Pairing: 6-digit PIN displayed on receiver, entered on sender → ECDH key exchange → derived TLS PSK.
-- Wire format: length-prefixed protobuf frames over TLS. Resumable per-record-type (so a dropped Wi-Fi connection during photo transfer doesn't restart SMS).
+A single Dart `Transport` interface with three concrete implementations, ranked by throughput:
+
+- **Wi-Fi Direct (primary).** Android `WifiP2pManager`. Receiver pins `groupOwnerIntent = 15` so the receiver is deterministically the group owner; sender connects to the framework-assigned `192.168.49.1`. No shared Wi-Fi network needed.
+- **Same-LAN mDNS (fallback).** Service `_smarterswitch._tcp`. Used when both phones are already on the same network or as fallback if Wi-Fi Direct group formation fails repeatedly.
+- **USB-C (gated on spike).** Android `UsbManager` host/accessory mode + Power Delivery Data Role Swap. Implemented only if `docs/usb-c-spike.md` clears its ≥10 MB/s exit criterion on consumer-grade cables. See that file for the cable matrix.
+
+Common protocol layer above the transport:
+
+- 6-digit PIN handshake. X25519 ECDH between the peers, with HKDF-SHA256 keyed by `(shared_secret, salt=PIN)`. Wrong PIN ⇒ statistically unrelated derived key ⇒ first authenticated message fails MAC ⇒ clean reject.
+- Wire format: length-prefixed (uint32 BE) frames over the link. Frames carry typed messages — Hello / Manifest / Record / Ack / Resume.
+- AES-GCM seal per frame using the handshake-derived key (32 bytes).
+- Resumable per-category. Each category gets its own monotonic uint64 sequence space and a write-ahead log on the receiver. On reconnect after a drop, receiver replays its highest-acked watermark to the sender; sender skips ahead. A photo-transfer drop doesn't restart SMS.
+
+Loopback `InMemoryTransport` for unit tests so the protocol layer is exercisable without any platform code.
 
 ### `platform/android`
 
