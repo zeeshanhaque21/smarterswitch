@@ -40,3 +40,20 @@ String normalizeBody(String raw) {
 int bucketTimestampToMinute(int timestampMs) {
   return timestampMs - (timestampMs % 60000);
 }
+
+/// Lower-case + whitespace-collapse + trim. Used for human-typed strings
+/// where capitalization shouldn't matter for identity (calendar titles,
+/// locations, contact names). Distinct from `normalizeBody` (case-sensitive)
+/// because SMS bodies *are* case-sensitive — "yes" and "YES" are different
+/// messages — while "Lunch with Alice" and "lunch with alice" are obviously
+/// the same calendar event.
+String normalizeTextCaseInsensitive(String raw) {
+  return raw.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+/// Email normalization: lowercase the whole address, trim. Strict by design
+/// — we don't strip `+tag` aliases or normalize subdomain variations because
+/// users intentionally use those as different addresses for filtering.
+String normalizeEmail(String raw) {
+  return raw.toLowerCase().trim();
+}
