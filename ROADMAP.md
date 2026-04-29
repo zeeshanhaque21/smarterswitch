@@ -7,15 +7,16 @@ Phased to derisk the hardest pieces first (SMS dedup correctness, default-SMS-ap
 - [x] Project directory + planning docs
 - [x] Flutter + Dart app scaffolded under `app/`
 - [x] Android module skeleton (Kotlin) wired to a stub `MethodChannel` bridge
-- [ ] iOS module skeleton (Swift) — deferred until a Mac is available; placeholder source files only
+- [x] iOS module skeleton (Swift) — placeholder `ios/Runner/native/ContactsChannel.swift`; full implementation deferred until a Mac is available
 
 ## Phase 1 — Android-only SMS dedup proof-of-concept
 
 The product's hardest correctness problem first.
 
-- [x] `SmsModule.kt`: read SMS via `content://sms`, emit normalized records
-- [x] `lib/core/dedup/sms.dart`: composite-hash matcher; unit tests with synthetic dupes (timestamp jitter, body whitespace, address formatting)
-- [ ] CLI harness (`tool/sms_diff.dart`) that takes two XML exports (from SMS Backup & Restore) and reports the dedup diff — proves the algorithm before the network/UI layers
+- [x] `SmsChannel.kt`: read SMS via `content://sms`, emit normalized records
+- [x] `lib/core/dedup/sms_dedup.dart`: composite-hash matcher; unit tests with synthetic dupes (timestamp jitter, body whitespace, address formatting)
+- [x] `lib/core/io/sms_backup_xml.dart`: parser for SMS Backup & Restore XML exports (sms + mms with content-hashed parts)
+- [x] CLI harness (`tool/sms_diff.dart`) that takes two XML exports and reports the dedup diff — `dart run tool/sms_diff.dart -s A.xml -t B.xml`
 - [ ] Validation set: real 5k+ SMS export from the user's S23 vs. Pixel 7 baseline; manually spot-check matches
 - [ ] Default-SMS-app handoff flow: write a small set of new messages back, verify thread integrity in Google Messages
 
