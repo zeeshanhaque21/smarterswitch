@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../platform/category_counts.dart';
+import 'conflicts.dart';
 
 /// Direction the user picks on the Pair screen. The same app binary is both
 /// sender and receiver — only the role differs at runtime.
@@ -68,6 +69,8 @@ class TransferState {
     },
     this.scanResult,
     this.categoryStatuses = const {},
+    this.conflicts = const [],
+    this.conflictDecisions = const {},
   });
 
   final DeviceRole role;
@@ -81,12 +84,23 @@ class TransferState {
   /// Result of the manifest exchange with the peer. Phase-2; null until then.
   final ScanResult? scanResult;
 
+  /// Fuzzy-match conflicts surfaced by the dedup engines for the user to
+  /// resolve. Populated after the manifest exchange; consumed by the
+  /// Conflict Review screen.
+  final List<Conflict> conflicts;
+
+  /// User decisions per conflict, keyed by index into [conflicts]. Defaults
+  /// to [ConflictDecision.keepBoth] for any unresolved entry.
+  final Map<int, ConflictDecision> conflictDecisions;
+
   TransferState copyWith({
     DeviceRole? role,
     String? peerName,
     Set<DataCategory>? selectedCategories,
     Map<DataCategory, CategoryStatus>? categoryStatuses,
     ScanResult? scanResult,
+    List<Conflict>? conflicts,
+    Map<int, ConflictDecision>? conflictDecisions,
   }) =>
       TransferState(
         role: role ?? this.role,
@@ -94,6 +108,8 @@ class TransferState {
         selectedCategories: selectedCategories ?? this.selectedCategories,
         categoryStatuses: categoryStatuses ?? this.categoryStatuses,
         scanResult: scanResult ?? this.scanResult,
+        conflicts: conflicts ?? this.conflicts,
+        conflictDecisions: conflictDecisions ?? this.conflictDecisions,
       );
 }
 
@@ -144,6 +160,19 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
 
   void setScanResult(ScanResult result) =>
       state = state.copyWith(scanResult: result);
+
+  void setConflicts(List<Conflict> conflicts) {
+    state = state.copyWith(
+      conflicts: conflicts,
+      conflictDecisions: const {},
+    );
+  }
+
+  void resolveConflict(int index, ConflictDecision decision) {
+    final next = Map<int, ConflictDecision>.from(state.conflictDecisions);
+    next[index] = decision;
+    state = state.copyWith(conflictDecisions: next);
+  }
 }
 
 final transferStateProvider =
