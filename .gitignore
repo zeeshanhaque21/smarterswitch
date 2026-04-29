@@ -1,0 +1,15 @@
+# Root-level .gitignore. The Flutter app under app/ has its own .gitignore that
+# already covers .dart_tool/, build/, .gradle/, Pods/, etc. Keep this short.
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.local
+
+# Local Claude/AI tool state
+.claude/
