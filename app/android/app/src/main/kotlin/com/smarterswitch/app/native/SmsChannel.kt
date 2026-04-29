@@ -23,14 +23,14 @@ import kotlinx.coroutines.withContext
  * Channel: `smarterswitch/sms`
  *
  * Methods:
- * - `readAll`: returns `List<Map<String, Any?>>` — every row from the sms
- *   provider, normalized to the keys expected by `SmsRecord.fromPlatformMap`
- *   on the Dart side. Performs the cursor read off the main thread.
- * - `hasReadPermission`: returns `Boolean`. Useful for the UI to decide whether
- *   to show the permission-request screen.
+ * - `hasReadPermission`: Boolean. The Select screen calls this before
+ *   showing the inline "Tap to allow" CTA.
+ * - `count`: Long. Single SELECT COUNT(*) over content://sms; used to render
+ *   the number on the Select screen.
+ * - `readAll`: List<Map<String, Any?>>. Full cursor read. Heavyweight; only
+ *   the dedup pass calls this.
  *
- * MMS read and default-SMS-app role grab land in a follow-up. This is the
- * Phase 1 minimum: enough to feed the dedup engine on real device data.
+ * MMS read and default-SMS-app role grab land in a follow-up.
  */
 object SmsChannel {
     private const val CHANNEL = "smarterswitch/sms"
@@ -41,6 +41,20 @@ object SmsChannel {
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "hasReadPermission" -> result.success(hasReadSmsPermission(activity))
+                "count" -> {
+                    if (!hasReadSmsPermission(activity)) {
+                        result.error("PERMISSION_DENIED", "READ_SMS not granted", null)
+                        return@setMethodCallHandler
+                    }
+                    scope.launch {
+                        try {
+                            val n = withContext(Dispatchers.IO) { countSms(activity) }
+                            result.success(n)
+                        } catch (e: Exception) {
+                            result.error("COUNT_FAILED", e.message, null)
+                        }
+                    }
+                }
                 "readAll" -> {
                     if (!hasReadSmsPermission(activity)) {
                         result.error("PERMISSION_DENIED", "READ_SMS not granted", null)
@@ -63,6 +77,15 @@ object SmsChannel {
     private fun hasReadSmsPermission(context: Context): Boolean {
         return ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) ==
             PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun countSms(context: Context): Long {
+        val resolver: ContentResolver = context.contentResolver
+        return resolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf(Telephony.Sms._ID),
+            null, null, null,
+        )?.use { it.count.toLong() } ?: 0L
     }
 
     private fun readAllSms(context: Context): List<Map<String, Any?>> {

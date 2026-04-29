@@ -17,6 +17,12 @@ class SmsReader {
     return granted ?? false;
   }
 
+  /// Cheap row count — `SELECT COUNT(*)` on the platform side, no row read.
+  /// Used by the Select screen so the count is visible before any heavy work
+  /// happens.
+  Future<int> count() async =>
+      (await _channel.invokeMethod<num>('count'))?.toInt() ?? 0;
+
   /// Read every SMS row from the device. The platform side performs the cursor
   /// read off the main thread; on a 5k-message device this is well under a
   /// second on modern hardware.

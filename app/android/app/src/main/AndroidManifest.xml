@@ -1,11 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Phase 1: SMS read for dedup. Write requires being default SMS app
-         (handled at runtime via RoleManager); declared as a normal permission
-         so the role-grab flow can succeed without an immediate manifest change. -->
+    <!-- Per-category read permissions. The Select screen's count() probe needs
+         each one; deeper read/write lands with each category's transfer
+         implementation. SMS write is gated separately at runtime via the
+         default-SMS-app RoleManager dance. -->
     <uses-permission android:name="android.permission.READ_SMS"/>
     <uses-permission android:name="android.permission.SEND_SMS"/>
     <uses-permission android:name="android.permission.RECEIVE_SMS"/>
     <uses-permission android:name="android.permission.RECEIVE_MMS"/>
+    <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+    <uses-permission android:name="android.permission.READ_CONTACTS"/>
+    <uses-permission android:name="android.permission.READ_CALENDAR"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
     <application
         android:label="SmarterSwitch"
         android:name="${applicationName}"
