@@ -4,11 +4,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../core/dedup/calendar_dedup.dart';
 import '../core/dedup/call_log_dedup.dart';
+import '../core/dedup/contacts_dedup.dart';
+import '../core/model/calendar_event.dart';
 import '../core/model/call_log_record.dart';
+import '../core/model/contact.dart';
 import '../core/transfer/manifest.dart';
 import '../core/transfer/transport.dart';
+import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
+import '../platform/contacts_reader.dart';
 import '../state/transfer_state.dart';
 
 /// Real per-category transfer.
@@ -97,13 +103,30 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             if (mounted) setState(() {});
           }
           break;
-        case DataCategory.sms:
         case DataCategory.contacts:
-        case DataCategory.photos:
+          final records = await ContactsReader().readAll();
+          for (final r in records) {
+            // Skip Google-synced contacts on the sender side — Google's own
+            // sync handles them across devices, and we don't want to write
+            // duplicates as on-device contacts on the receiver.
+            if (r.isGoogleSynced) continue;
+            await session.sendFrame(ContactRecordEnvelope(r).toBytes());
+            _processed[category] = (_processed[category] ?? 0) + 1;
+            if (mounted) setState(() {});
+          }
+          break;
         case DataCategory.calendar:
-          // v0.4: only call log is wired end-to-end. The other categories
-          // are still in the manifest for the user-visible plan but no
-          // records are streamed yet.
+          final records = await CalendarReader().readAll();
+          for (final r in records) {
+            await session.sendFrame(CalendarEventEnvelope(r).toBytes());
+            _processed[category] = (_processed[category] ?? 0) + 1;
+            if (mounted) setState(() {});
+          }
+          break;
+        case DataCategory.sms:
+        case DataCategory.photos:
+          // v0.5: SMS needs the default-SMS-app role grab; photos need
+          // chunked file-byte streaming. Wired in later releases.
           break;
       }
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
@@ -115,13 +138,24 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
-    // Build a dedup index of *what we already have* so we know which incoming
-    // records are duplicates. Only call log is wired in v0.4; the other
-    // categories' indexes land alongside their writers.
+    // Build per-category dedup indexes from what already exists locally,
+    // so incoming records that match get skipped instead of duplicated.
     final callLogIndex = manifest.categories.contains(DataCategory.callLog)
         ? CallLogDedup.indexOf(await CallLogReader().readAll())
         : <CallLogDedupKey>{};
+    final contactsKeys = manifest.categories.contains(DataCategory.contacts)
+        ? <Set<String>>[
+            for (final c in await ContactsReader().readAll())
+              ContactsDedup.matchKeysFor(c),
+          ]
+        : <Set<String>>[];
+    final calendarIndex = manifest.categories.contains(DataCategory.calendar)
+        ? CalendarDedup.indexOf(await CalendarReader().readAll())
+        : <CalendarDedupKey>{};
+
     final pendingCallLogWrites = <CallLogRecord>[];
+    final pendingContactWrites = <Contact>[];
+    final pendingCalendarWrites = <CalendarEvent>[];
     final completer = Completer<void>();
 
     _incomingSub = session.incomingFrames().listen(
@@ -144,18 +178,59 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   (_processed[DataCategory.callLog] ?? 0) + 1;
               if (mounted) setState(() {});
               break;
+            case ContactRecordEnvelope(:final record):
+              final keys = ContactsDedup.matchKeysFor(record);
+              final isDup = keys.isNotEmpty &&
+                  contactsKeys.any((existing) =>
+                      existing.intersection(keys).length == keys.length);
+              if (isDup) {
+                _skippedByCategory[DataCategory.contacts] =
+                    (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
+              } else {
+                pendingContactWrites.add(record);
+              }
+              _processed[DataCategory.contacts] =
+                  (_processed[DataCategory.contacts] ?? 0) + 1;
+              if (mounted) setState(() {});
+              break;
+            case CalendarEventEnvelope(:final record):
+              if (CalendarDedup.isDuplicate(calendarIndex, record)) {
+                _skippedByCategory[DataCategory.calendar] =
+                    (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
+              } else {
+                pendingCalendarWrites.add(record);
+              }
+              _processed[DataCategory.calendar] =
+                  (_processed[DataCategory.calendar] ?? 0) + 1;
+              if (mounted) setState(() {});
+              break;
             case CategoryDoneEnvelope(:final category):
-              if (category == DataCategory.callLog &&
-                  pendingCallLogWrites.isNotEmpty) {
-                final batch =
-                    List<CallLogRecord>.from(pendingCallLogWrites);
-                pendingCallLogWrites.clear();
-                CallLogReader().writeAll(batch).then((written) {
-                  _writtenByCategory[DataCategory.callLog] =
-                      (_writtenByCategory[DataCategory.callLog] ?? 0) +
-                          written;
-                  if (mounted) setState(() {});
-                });
+              switch (category) {
+                case DataCategory.callLog:
+                  _flushBatch<CallLogRecord>(
+                    pending: pendingCallLogWrites,
+                    write: CallLogReader().writeAll,
+                    category: DataCategory.callLog,
+                  );
+                  break;
+                case DataCategory.contacts:
+                  _flushBatch<Contact>(
+                    pending: pendingContactWrites,
+                    write: ContactsReader().writeAll,
+                    category: DataCategory.contacts,
+                  );
+                  break;
+                case DataCategory.calendar:
+                  _flushBatch<CalendarEvent>(
+                    pending: pendingCalendarWrites,
+                    write: CalendarReader().writeAll,
+                    category: DataCategory.calendar,
+                  );
+                  break;
+                case DataCategory.sms:
+                case DataCategory.photos:
+                  // No writer wired yet for these; nothing to flush.
+                  break;
               }
               break;
             case TransferDoneEnvelope():
@@ -177,6 +252,23 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     );
 
     await completer.future;
+  }
+
+  // -------------------------------------------------------- Per-cat flush
+
+  void _flushBatch<T>({
+    required List<T> pending,
+    required Future<int> Function(List<T>) write,
+    required DataCategory category,
+  }) {
+    if (pending.isEmpty) return;
+    final batch = List<T>.from(pending);
+    pending.clear();
+    write(batch).then((written) {
+      _writtenByCategory[category] =
+          (_writtenByCategory[category] ?? 0) + written;
+      if (mounted) setState(() {});
+    });
   }
 
   // ----------------------------------------------------------------- Render
@@ -246,9 +338,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final total = manifest.counts[c] ?? 0;
     final done = _processed[c] ?? 0;
     final progress = total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0);
-    final isCallLogReceiver = c == DataCategory.callLog &&
-        ref.read(transferStateProvider).role == DeviceRole.receiver;
-    final detail = isCallLogReceiver
+    final role = ref.read(transferStateProvider).role;
+    final isReceiver = role == DeviceRole.receiver;
+    final hasWriter = c == DataCategory.callLog ||
+        c == DataCategory.contacts ||
+        c == DataCategory.calendar;
+    final detail = isReceiver && hasWriter
         ? '$done / $total received '
             '(${_writtenByCategory[c] ?? 0} new, '
             '${_skippedByCategory[c] ?? 0} duplicates)'

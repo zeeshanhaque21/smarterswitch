@@ -2,7 +2,9 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../../state/transfer_state.dart';
+import '../model/calendar_event.dart';
 import '../model/call_log_record.dart';
+import '../model/contact.dart';
 
 /// Sender-side declaration of what's about to be transferred. Sent as the
 /// first framed message after pairing. The receiver uses this to:
@@ -86,6 +88,14 @@ sealed class TransferEnvelope {
         return CallLogRecordEnvelope(
           CallLogRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
         );
+      case 'contact_record':
+        return ContactRecordEnvelope(
+          ContactCodec.fromJson(raw['record'] as Map<String, dynamic>),
+        );
+      case 'calendar_record':
+        return CalendarEventEnvelope(
+          CalendarEventCodec.fromJson(raw['record'] as Map<String, dynamic>),
+        );
       case 'category_done':
         return CategoryDoneEnvelope(
           DataCategory.values.firstWhere(
@@ -114,6 +124,26 @@ class CallLogRecordEnvelope extends TransferEnvelope {
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'call_log_record',
         'record': CallLogRecordCodec.toJson(record),
+      })));
+}
+
+class ContactRecordEnvelope extends TransferEnvelope {
+  ContactRecordEnvelope(this.record);
+  final Contact record;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'contact_record',
+        'record': ContactCodec.toJson(record),
+      })));
+}
+
+class CalendarEventEnvelope extends TransferEnvelope {
+  CalendarEventEnvelope(this.record);
+  final CalendarEvent record;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'calendar_record',
+        'record': CalendarEventCodec.toJson(record),
       })));
 }
 
@@ -153,5 +183,47 @@ class CallLogRecordCodec {
           orElse: () => CallDirection.incoming,
         ),
         cachedName: m['cachedName'] as String?,
+      );
+}
+
+class ContactCodec {
+  static Map<String, dynamic> toJson(Contact c) => {
+        'displayName': c.displayName,
+        'sourceAccountType': c.sourceAccountType,
+        'phones': c.phones,
+        'emails': c.emails,
+      };
+
+  static Contact fromJson(Map<String, dynamic> m) => Contact(
+        displayName: m['displayName'] as String? ?? '',
+        sourceAccountType: m['sourceAccountType'] as String?,
+        phones: ((m['phones'] as List<dynamic>?) ?? const [])
+            .cast<String>()
+            .toList(growable: false),
+        emails: ((m['emails'] as List<dynamic>?) ?? const [])
+            .cast<String>()
+            .toList(growable: false),
+      );
+}
+
+class CalendarEventCodec {
+  static Map<String, dynamic> toJson(CalendarEvent e) => {
+        'uid': e.uid,
+        'title': e.title,
+        'location': e.location,
+        'startUtcMs': e.startUtcMs,
+        'endUtcMs': e.endUtcMs,
+        'allDay': e.allDay,
+        'recurrence': e.recurrence,
+      };
+
+  static CalendarEvent fromJson(Map<String, dynamic> m) => CalendarEvent(
+        uid: m['uid'] as String?,
+        title: m['title'] as String? ?? '',
+        location: m['location'] as String? ?? '',
+        startUtcMs: (m['startUtcMs'] as num?)?.toInt() ?? 0,
+        endUtcMs: (m['endUtcMs'] as num?)?.toInt() ?? 0,
+        allDay: m['allDay'] as bool? ?? false,
+        recurrence: m['recurrence'] as String?,
       );
 }

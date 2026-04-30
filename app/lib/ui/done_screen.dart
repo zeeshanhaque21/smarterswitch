@@ -69,7 +69,10 @@ class DoneScreen extends ConsumerWidget {
     final written = state.writtenByCategory[c] ?? 0;
     final skipped = state.skippedByCategory[c] ?? 0;
     final total = manifest.counts[c] ?? 0;
-    if (c == DataCategory.callLog) {
+    final hasWriter = c == DataCategory.callLog ||
+        c == DataCategory.contacts ||
+        c == DataCategory.calendar;
+    if (hasWriter) {
       return '$written new, $skipped duplicates skipped (of $total)';
     }
     // Other categories: writers not yet implemented.

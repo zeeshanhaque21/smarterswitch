@@ -10,33 +10,9 @@ library;
 
 import 'package:flutter/services.dart';
 
-// CallLogReader lives in `lib/platform/call_log_reader.dart` because it grew a
-// readAll/writeAll surface that doesn't fit the count-only shape of the
-// other wrappers in this file.
-
-class ContactsReader {
-  ContactsReader({MethodChannel? channel})
-      : _channel = channel ?? const MethodChannel('smarterswitch/contacts');
-  final MethodChannel _channel;
-
-  Future<bool> hasReadPermission() async =>
-      (await _channel.invokeMethod<bool>('hasReadPermission')) ?? false;
-
-  Future<int> count() async =>
-      (await _channel.invokeMethod<num>('count'))?.toInt() ?? 0;
-}
-
-class CalendarReader {
-  CalendarReader({MethodChannel? channel})
-      : _channel = channel ?? const MethodChannel('smarterswitch/calendar');
-  final MethodChannel _channel;
-
-  Future<bool> hasReadPermission() async =>
-      (await _channel.invokeMethod<bool>('hasReadPermission')) ?? false;
-
-  Future<int> count() async =>
-      (await _channel.invokeMethod<num>('count'))?.toInt() ?? 0;
-}
+// CallLogReader, ContactsReader, and CalendarReader live in their own files
+// (lib/platform/<category>_reader.dart). They each grew a readAll/writeAll
+// surface that doesn't fit the count-only shape of the wrappers below.
 
 class MediaReader {
   MediaReader({MethodChannel? channel})
