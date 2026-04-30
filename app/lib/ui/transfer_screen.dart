@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../core/dedup/calendar_dedup.dart';
 import '../core/dedup/call_log_dedup.dart';
@@ -18,6 +19,7 @@ import '../core/transfer/transport.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
 import '../platform/contacts_reader.dart';
+import '../platform/foreground_service.dart';
 import '../platform/media_reader.dart';
 import '../platform/sms_reader.dart';
 import '../state/transfer_state.dart';
@@ -51,16 +53,30 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   bool _done = false;
   String? _error;
   StreamSubscription? _incomingSub;
+  final _foreground = ForegroundService();
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // Notification permission is required on Android 13+ for the
+      // foreground service to actually display its ongoing notification.
+      // If denied the FGS still runs but headlessly; we proceed either way.
+      try {
+        await Permission.notification.request();
+      } catch (_) {}
+      // Hold the OS to the transfer; Android otherwise kills the socket
+      // and CPU within seconds of screen-off, so a 30-minute photo
+      // migration would die any time the phone screen sleeps.
+      await _foreground.start();
+      await _start();
+    });
   }
 
   @override
   void dispose() {
     _incomingSub?.cancel();
+    _foreground.stop();
     super.dispose();
   }
 
