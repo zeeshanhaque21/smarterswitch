@@ -48,8 +48,6 @@ class LanTransport implements Transport {
 
     Future<void> emitNew() async {
       for (final service in discovery.services) {
-        // Some platforms return services already-resolved (host/port set);
-        // others return only name+type and require an explicit resolve.
         nsd.Service resolved = service;
         if (resolved.host == null || resolved.port == null) {
           try {
@@ -72,7 +70,6 @@ class LanTransport implements Transport {
     }
 
     discovery.addListener(() {
-      // Fire-and-forget; emitNew handles its own errors.
       emitNew();
     });
     await emitNew();
@@ -82,10 +79,8 @@ class LanTransport implements Transport {
 
   @override
   Future<void> advertise({required String displayName}) async {
-    // Start the listener now so we already have a port to advertise.
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
     _server = server;
-
     final registration = await nsd.register(nsd.Service(
       name: displayName,
       type: serviceType,
@@ -114,20 +109,26 @@ class LanTransport implements Transport {
     if (parts.length != 2) throw StateError('Bad peer id ${peer.id}');
     final host = parts[0];
     final port = int.parse(parts[1]);
-    final socket = await Socket.connect(host, port,
-        timeout: const Duration(seconds: 10));
-    // Sender protocol: send PIN line, await OK.
+    final socket = await Socket.connect(
+      host,
+      port,
+      timeout: const Duration(seconds: 10),
+    );
+    // Hand the socket to the session immediately — the session owns the only
+    // listener from this point on. Mixing `socket.listen` with `await for`
+    // throws "Stream already listened to" because Socket is single-sub.
+    final session = _LanSession(
+      peerDisplayName: peer.displayName,
+      socket: socket,
+    );
     socket.write('PIN $pin\n');
     await socket.flush();
-    final replyBytes = await _readLine(socket);
-    final reply = utf8.decode(replyBytes).trim();
+    final reply = (await session._readHandshakeLine()).trim();
     if (reply == 'OK') {
-      return _LanSession(
-        peerDisplayName: peer.displayName,
-        socket: socket,
-      );
+      session._handshakeDone();
+      return session;
     }
-    socket.destroy();
+    await session.close();
     throw const PinMismatchException();
   }
 
@@ -142,27 +143,28 @@ class LanTransport implements Transport {
     _acceptCompleter = completer;
 
     _serverSub = server.listen((socket) async {
+      // Same single-listener invariant as connect(): the session is built
+      // first; the session's listener consumes the handshake line and then
+      // forwards subsequent bytes.
+      final session = _LanSession(
+        peerDisplayName: socket.remoteAddress.address,
+        socket: socket,
+      );
       try {
-        final line = await _readLine(socket);
-        final received = utf8.decode(line).trim();
+        final received = (await session._readHandshakeLine()).trim();
         if (received.startsWith('PIN ') &&
             received.substring(4) == _expectedPin) {
           socket.write('OK\n');
           await socket.flush();
-          if (!completer.isCompleted) {
-            completer.complete(_LanSession(
-              peerDisplayName:
-                  socket.remoteAddress.address, // upgraded by app layer later
-              socket: socket,
-            ));
-          }
+          session._handshakeDone();
+          if (!completer.isCompleted) completer.complete(session);
         } else {
           socket.write('BAD\n');
           await socket.flush();
-          socket.destroy();
+          await session.close();
         }
       } catch (e) {
-        socket.destroy();
+        await session.close();
       }
     });
 
@@ -192,33 +194,24 @@ class LanTransport implements Transport {
       _acceptCompleter!.completeError(StateError('Transport closed'));
     }
   }
-
-  /// Read bytes until `\n`. Returns the bytes excluding the newline.
-  static Future<Uint8List> _readLine(Socket socket) async {
-    final buffer = BytesBuilder(copy: false);
-    await for (final chunk in socket) {
-      for (final byte in chunk) {
-        if (byte == 0x0a) {
-          return buffer.toBytes();
-        }
-        buffer.addByte(byte);
-      }
-    }
-    return buffer.toBytes();
-  }
 }
 
+/// Session backed by a TCP socket. The session owns the *only* listener on
+/// the socket. During the handshake phase, incoming bytes accumulate in a
+/// line buffer and are consumed by [_readHandshakeLine]. After
+/// [_handshakeDone] is called, subsequent bytes are forwarded to
+/// [incomingFrames].
 class _LanSession implements PairedSession {
   _LanSession({required this.peerDisplayName, required Socket socket})
       : _socket = socket {
-    _socket.listen(
-      (data) {
-        // Buffer raw bytes; framed-decode happens at a higher layer once
-        // FrameCodec is plugged in.
-        _incoming.add(Uint8List.fromList(data));
+    _subscription = socket.listen(
+      _onData,
+      onDone: () {
+        if (!_incoming.isClosed) _incoming.close();
       },
-      onDone: () => _incoming.close(),
-      onError: (_) => _incoming.close(),
+      onError: (Object e) {
+        if (!_incoming.isClosed) _incoming.close();
+      },
     );
   }
 
@@ -226,8 +219,57 @@ class _LanSession implements PairedSession {
   final String peerDisplayName;
 
   final Socket _socket;
+  late final StreamSubscription<Uint8List> _subscription;
+
+  bool _handshakeFinished = false;
+  final BytesBuilder _handshakeBuffer = BytesBuilder(copy: false);
+  Completer<String>? _readLineCompleter;
   final StreamController<Uint8List> _incoming =
       StreamController<Uint8List>.broadcast();
+
+  Future<String> _readHandshakeLine() {
+    final c = Completer<String>();
+    _readLineCompleter = c;
+    return c.future;
+  }
+
+  void _handshakeDone() {
+    _handshakeFinished = true;
+    // Anything still in the buffer (rare — but a peer can pipeline) goes to
+    // incoming as the first frame so post-handshake reads don't lose data.
+    if (_handshakeBuffer.length > 0) {
+      _incoming.add(_handshakeBuffer.toBytes());
+      _handshakeBuffer.clear();
+    }
+  }
+
+  void _onData(Uint8List data) {
+    if (_handshakeFinished) {
+      _incoming.add(data);
+      return;
+    }
+    // Still in handshake: scan for the first newline; up to it is the line,
+    // anything after it stays buffered for later (typically nothing).
+    for (var i = 0; i < data.length; i++) {
+      final byte = data[i];
+      if (byte == 0x0a) {
+        final line = utf8.decode(_handshakeBuffer.toBytes());
+        _handshakeBuffer.clear();
+        // Keep any bytes after the newline; they'll either feed another
+        // handshake line (unlikely) or be flushed to incoming when
+        // _handshakeDone is called.
+        if (i + 1 < data.length) {
+          _handshakeBuffer.add(data.sublist(i + 1));
+        }
+        final c = _readLineCompleter;
+        _readLineCompleter = null;
+        c?.complete(line);
+        return;
+      } else {
+        _handshakeBuffer.addByte(byte);
+      }
+    }
+  }
 
   @override
   Future<void> sendFrame(Uint8List frame) async {
@@ -243,7 +285,10 @@ class _LanSession implements PairedSession {
 
   @override
   Future<void> close() async {
-    await _socket.close();
+    await _subscription.cancel();
+    try {
+      await _socket.close();
+    } catch (_) {}
     if (!_incoming.isClosed) await _incoming.close();
   }
 }
