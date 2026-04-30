@@ -59,6 +59,19 @@ class MediaReader {
         '';
   }
 
+  /// Compute the perceptual hash of a photo. Returns null if the URI
+  /// can't be decoded as an image (e.g. video, unsupported RAW format).
+  /// The matcher in `core/dedup/photos_dedup.dart` uses this for fuzzy
+  /// matches — a re-encoded copy of the same image differs in sha256
+  /// but matches in pHash within a few Hamming-distance bits.
+  Future<int?> computePHash(String uri) async {
+    try {
+      return await _channel.invokeMethod<int>('computePHash', {'uri': uri});
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<Uint8List> readChunk(String uri, int offset, int length) async {
     final bytes = await _channel.invokeMethod<Uint8List>(
       'readChunk',

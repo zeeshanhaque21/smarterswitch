@@ -107,10 +107,16 @@ sealed class TransferEnvelope {
       case 'media_end':
         return MediaEndEnvelope(sha256: raw['sha256'] as String);
       case 'photo_hashes':
+        // v0.13+: 'entries' carries {sha256, phash}. Older 'hashes' was
+        // a bare List<String> of sha256s — handled per-element via
+        // PhotoHashEntry.fromJson back-compat.
+        final rawEntries = (raw['entries'] as List<dynamic>?) ??
+            (raw['hashes'] as List<dynamic>?) ??
+            const [];
         return PhotoHashesEnvelope(
-          hashes: ((raw['hashes'] as List<dynamic>?) ?? const [])
-              .cast<String>()
-              .toList(growable: false),
+          entries: [
+            for (final e in rawEntries) PhotoHashEntry.fromJson(e),
+          ],
         );
       case 'photo_skip_list':
         return PhotoSkipListEnvelope(
@@ -223,17 +229,45 @@ class MediaEndEnvelope extends TransferEnvelope {
       })));
 }
 
+/// One entry in the pre-flight photo hash list. Carries both an exact
+/// sha256 and an optional 64-bit perceptual hash. The pHash is null for
+/// images Android can't decode natively (videos, some RAW formats).
+class PhotoHashEntry {
+  const PhotoHashEntry({required this.sha256, this.pHash});
+  final String sha256;
+  final int? pHash;
+
+  Map<String, dynamic> toJson() => {
+        'sha256': sha256,
+        if (pHash != null) 'phash': pHash,
+      };
+
+  static PhotoHashEntry fromJson(Object? raw) {
+    if (raw is String) {
+      // Back-compat: v0.12 and earlier sent bare sha256 strings.
+      return PhotoHashEntry(sha256: raw);
+    }
+    final m = raw as Map<String, dynamic>;
+    return PhotoHashEntry(
+      sha256: m['sha256'] as String,
+      pHash: (m['phash'] as num?)?.toInt(),
+    );
+  }
+}
+
 /// Pre-flight hash list from sender → receiver, before any photo bytes
 /// flow. Receiver replies with [PhotoSkipListEnvelope] naming the hashes
-/// it already has; sender then streams only the misses, eliminating the
-/// duplicate-bandwidth waste that v0.7 had.
+/// it already has; sender then streams only the misses. v0.13 added
+/// pHash alongside sha256 so the receiver can also surface fuzzy matches
+/// (re-encoded copies of the same image, different bytes, near-identical
+/// pHash).
 class PhotoHashesEnvelope extends TransferEnvelope {
-  PhotoHashesEnvelope({required this.hashes});
-  final List<String> hashes;
+  PhotoHashesEnvelope({required this.entries});
+  final List<PhotoHashEntry> entries;
   @override
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'photo_hashes',
-        'hashes': hashes,
+        'entries': [for (final e in entries) e.toJson()],
       })));
 }
 

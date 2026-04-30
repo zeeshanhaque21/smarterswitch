@@ -5,10 +5,14 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import androidx.core.content.ContextCompat
+import kotlin.math.cos
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -62,6 +66,7 @@ object MediaChannel {
                 "summary" -> handleSummary(activity, scope, result)
                 "readMetadata" -> handleReadMetadata(activity, scope, result)
                 "readSha256" -> handleReadSha256(activity, scope, call, result)
+                "computePHash" -> handleComputePHash(activity, scope, call, result)
                 "readChunk" -> handleReadChunk(activity, scope, call, result)
                 "writeStart" -> handleWriteStart(activity, scope, call, result)
                 "writeChunk" -> handleWriteChunk(scope, call, result)
@@ -158,6 +163,31 @@ object MediaChannel {
                 result.success(hex)
             } catch (e: Exception) {
                 result.error("SHA_FAILED", e.message, null)
+            }
+        }
+    }
+
+    private fun handleComputePHash(
+        activity: Activity,
+        scope: CoroutineScope,
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        val uriString = call.argument<String>("uri")
+        if (uriString == null) {
+            result.error("BAD_ARGUMENT", "uri required", null)
+            return
+        }
+        scope.launch {
+            try {
+                val hash = withContext(Dispatchers.IO) {
+                    computePHash(activity, Uri.parse(uriString))
+                }
+                // Dart receives a Long; null on failures (decode error,
+                // unsupported format, etc).
+                result.success(hash)
+            } catch (e: Exception) {
+                result.error("PHASH_FAILED", e.message, null)
             }
         }
     }
@@ -365,6 +395,82 @@ object MediaChannel {
             }
         }
         return out
+    }
+
+    /// 64-bit perceptual hash via the standard DCT pHash algorithm:
+    /// 1. Decode bitmap, scale to 32×32.
+    /// 2. Convert to grayscale.
+    /// 3. 2D DCT-II.
+    /// 4. Take top-left 8×8 (low-frequency components).
+    /// 5. Compute mean (excluding the [0][0] DC term — heavy bias).
+    /// 6. Bit per coefficient: 1 if > mean, 0 otherwise.
+    /// 7. Pack into a 64-bit Long.
+    ///
+    /// Returns `null` if the bitmap can't be decoded (e.g. videos, RAW
+    /// formats Android doesn't natively support). Dart-side then treats
+    /// the photo as having no pHash and falls back to sha256-only dedup.
+    private fun computePHash(context: Context, uri: Uri): Long? {
+        val bitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream)
+        } ?: return null
+        val scaled = Bitmap.createScaledBitmap(bitmap, 32, 32, true)
+        if (scaled !== bitmap) bitmap.recycle()
+        val gray = DoubleArray(32 * 32)
+        for (y in 0 until 32) {
+            for (x in 0 until 32) {
+                val c = scaled.getPixel(x, y)
+                // Luminance via the BT.601 weights — close enough for pHash;
+                // any reasonable grayscale conversion produces stable hashes.
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                gray[y * 32 + x] = 0.299 * r + 0.587 * g + 0.114 * b
+            }
+        }
+        scaled.recycle()
+        // 2D DCT-II — separable. Compute row DCTs first, then column DCTs
+        // on the result. We only need the top-left 8×8 of the output, but
+        // computing the full 32×32 keeps the code simple; perf is fine
+        // (sub-millisecond per photo on modern Android hardware).
+        val temp = DoubleArray(32 * 32)
+        for (y in 0 until 32) {
+            for (u in 0 until 32) {
+                var sum = 0.0
+                for (x in 0 until 32) {
+                    sum += gray[y * 32 + x] * cos((2 * x + 1) * u * Math.PI / 64.0)
+                }
+                temp[y * 32 + u] = sum
+            }
+        }
+        val dct = DoubleArray(32 * 32)
+        for (u in 0 until 32) {
+            for (v in 0 until 32) {
+                var sum = 0.0
+                for (y in 0 until 32) {
+                    sum += temp[y * 32 + u] *
+                        cos((2 * y + 1) * v * Math.PI / 64.0)
+                }
+                // Normalization: scaling by sqrt(2/N) per DCT axis. Doesn't
+                // affect the final hash bits since we threshold at the
+                // mean — but keeps the values in a sensible range.
+                dct[v * 32 + u] = sum / 16.0
+            }
+        }
+        // Top-left 8×8, skip DC.
+        val low = DoubleArray(64)
+        for (y in 0 until 8) {
+            for (x in 0 until 8) {
+                low[y * 8 + x] = dct[y * 32 + x]
+            }
+        }
+        var sum = 0.0
+        for (i in 1 until 64) sum += low[i]
+        val mean = sum / 63.0
+        var hash = 0L
+        for (i in 0 until 64) {
+            if (low[i] > mean) hash = hash or (1L shl i)
+        }
+        return hash
     }
 
     private fun sha256Hex(context: Context, uri: Uri): String {

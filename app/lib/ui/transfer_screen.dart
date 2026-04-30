@@ -10,10 +10,12 @@ import 'package:permission_handler/permission_handler.dart';
 import '../core/dedup/calendar_dedup.dart';
 import '../core/dedup/call_log_dedup.dart';
 import '../core/dedup/contacts_dedup.dart';
+import '../core/dedup/photos_dedup.dart';
 import '../core/dedup/sms_dedup.dart';
 import '../core/model/calendar_event.dart';
 import '../core/model/call_log_record.dart';
 import '../core/model/contact.dart';
+import '../core/model/media_record.dart';
 import '../core/model/sms_record.dart';
 import '../core/transfer/manifest.dart';
 import '../core/transfer/transport.dart';
@@ -225,11 +227,18 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     // pole on a 30k-photo library (~2 minutes); progress is exposed to
     // the user via the Hashing column.
     final hashed = <String, MediaMetadata>{};
+    final pHashBySha = <String, int>{};
     for (final f in files) {
       try {
         final sha = await reader.readSha256(f.uri);
         if (!hashed.containsKey(sha)) {
           hashed[sha] = f;
+          // pHash is best-effort: videos return null, RAW formats return
+          // null. Receiver-side fuzzy match treats null pHash as "skip".
+          if (f.kind == MediaKind.image) {
+            final ph = await reader.computePHash(f.uri);
+            if (ph != null) pHashBySha[sha] = ph;
+          }
         }
         _hashed += 1;
         if (mounted) setState(() {});
@@ -240,7 +249,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
     // Send the hashes; await the receiver's skip list.
     await session.sendFrame(PhotoHashesEnvelope(
-      hashes: hashed.keys.toList(growable: false),
+      entries: [
+        for (final sha in hashed.keys)
+          PhotoHashEntry(sha256: sha, pHash: pHashBySha[sha]),
+      ],
     ).toBytes());
     final skipSet = <String>{};
     final waitForSkip = Completer<void>();
@@ -362,14 +374,23 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
     // Photos: streaming-by-sha256. Either we're skipping (sha256 already on
     // device) or actively writing (MediaStore stream open in Kotlin land).
+    // v0.13: also collect pHashes from the local library so the
+    // receiver can surface fuzzy matches (re-encoded copies) on
+    // PhotoHashesEnvelope receipt.
     final mediaReader = MediaReader();
-    final localMediaShas =
-        manifest.categories.contains(DataCategory.photos)
-            ? <String>{
-                for (final m in await mediaReader.readMetadata())
-                  await mediaReader.readSha256(m.uri),
-              }
-            : <String>{};
+    final localMediaShas = <String>{};
+    final localMediaPHashes = <int>[];
+    if (manifest.categories.contains(DataCategory.photos)) {
+      for (final m in await mediaReader.readMetadata()) {
+        try {
+          localMediaShas.add(await mediaReader.readSha256(m.uri));
+          if (m.kind == MediaKind.image) {
+            final ph = await mediaReader.computePHash(m.uri);
+            if (ph != null) localMediaPHashes.add(ph);
+          }
+        } catch (_) {/* file disappeared */}
+      }
+    }
     String? activeMediaSha;
     bool skippingActiveMedia = false;
 
@@ -436,17 +457,41 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               ackReceived(DataCategory.calendar);
               if (mounted) setState(() {});
               break;
-            case PhotoHashesEnvelope(:final hashes):
-              // Receiver: reply with which sha256s are already on this
-              // device so the sender doesn't waste bandwidth on dupes.
-              final skip = hashes
-                  .where(localMediaShas.contains)
-                  .toList(growable: false);
+            case PhotoHashesEnvelope(:final entries):
+              // Exact sha256 matches → skip (existing v0.9 behavior).
+              final skip = <String>[];
+              var fuzzyCount = 0;
+              for (final e in entries) {
+                if (localMediaShas.contains(e.sha256)) {
+                  skip.add(e.sha256);
+                  continue;
+                }
+                // Fuzzy: incoming pHash within threshold of any local
+                // pHash. v0.13 auto-resolves these as "keep both" — the
+                // sender still streams the file, receiver writes it as a
+                // new entry, the user sees the duplicate visually but no
+                // data is lost. The mid-transfer conflict-review UI gate
+                // is v0.14 work.
+                final ph = e.pHash;
+                if (ph == null) continue;
+                for (final localPh in localMediaPHashes) {
+                  if (PhotosDedup.hammingDistance64(ph, localPh) <=
+                      PhotosDedup.defaultPhashThreshold) {
+                    fuzzyCount += 1;
+                    break;
+                  }
+                }
+              }
+              if (fuzzyCount > 0) {
+                debugPrint(
+                  'v0.13 pHash: $fuzzyCount near-match photos auto-'
+                  'resolved as Keep Both — full review-screen gate '
+                  'lands in v0.14.',
+                );
+              }
               session
                   .sendFrame(PhotoSkipListEnvelope(skip: skip).toBytes())
                   .catchError((Object _) {});
-              // Also pre-credit the skipped count to the per-category
-              // tally so the UI reflects the eventual outcome.
               _skippedByCategory[DataCategory.photos] =
                   (_skippedByCategory[DataCategory.photos] ?? 0) + skip.length;
               if (mounted) setState(() {});
