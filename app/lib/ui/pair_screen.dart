@@ -5,9 +5,11 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../core/transfer/lan_transport.dart';
 import '../core/transfer/transport.dart';
+import '../core/transfer/wifi_direct_transport.dart';
 import '../state/transfer_state.dart';
 
 enum _PairPhase {
@@ -66,13 +68,32 @@ class _Step extends StatelessWidget {
 class _PairScreenState extends ConsumerState<PairScreen> {
   _PairPhase _phase = _PairPhase.rolePicker;
   String _statusLine = '';
-  LanTransport? _transport;
+  Transport? _transport;
   StreamSubscription<DiscoveredPeer>? _peerSub;
   final List<DiscoveredPeer> _peers = [];
   DiscoveredPeer? _chosenPeer;
   String _pin = '';
   String _pinInput = '';
   String? _errorMessage;
+
+  /// Defaults to Wi-Fi Direct (works without a shared router). User can
+  /// flip the link in the role picker to use the LAN-mDNS path instead.
+  bool _useWifiDirect = true;
+  bool _wifiDirectAvailable = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final available = await WifiDirectTransport.isAvailable();
+      if (!mounted) return;
+      setState(() {
+        _wifiDirectAvailable = available;
+        // If the device doesn't support Wi-Fi Direct at all, default to LAN.
+        if (!available) _useWifiDirect = false;
+      });
+    });
+  }
 
   @override
   void dispose() {
@@ -81,11 +102,33 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     super.dispose();
   }
 
+  Transport _buildTransport() =>
+      _useWifiDirect ? WifiDirectTransport() : LanTransport();
+
+  /// Wi-Fi Direct + Wi-Fi-LAN discovery both want fine-location on API ≤ 32
+  /// (legacy NEARBY_WIFI_DEVICES gate) and the new NEARBY_WIFI_DEVICES on
+  /// API 33+. Request both proactively before starting either transport so
+  /// discovery doesn't silently fail.
+  Future<void> _requestNetworkPermissions() async {
+    try {
+      await Future.wait([
+        Permission.locationWhenInUse.request(),
+        Permission.nearbyWifiDevices.request(),
+      ]);
+    } catch (_) {
+      // Older devices may not support Permission.nearbyWifiDevices; the
+      // wrapper throws PlatformException. Either way, the transport is
+      // resilient — it'll fail at discoverPeers if perms are missing and
+      // the user can fall back via the LAN link.
+    }
+  }
+
   // ---------------------------------------------------------------- Receiver
 
   Future<void> _startAsReceiver() async {
+    await _requestNetworkPermissions();
     final pin = _generatePin();
-    final transport = LanTransport();
+    final transport = _buildTransport();
     setState(() {
       _phase = _PairPhase.receiverWaiting;
       _pin = pin;
@@ -125,7 +168,8 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   // ------------------------------------------------------------------ Sender
 
   Future<void> _startAsSender() async {
-    final transport = LanTransport();
+    await _requestNetworkPermissions();
+    final transport = _buildTransport();
     setState(() {
       _phase = _PairPhase.senderDiscovering;
       _peers.clear();
@@ -277,8 +321,11 @@ class _PairScreenState extends ConsumerState<PairScreen> {
           // the same thing. Same-screen-on-both was confusing in v0.2.0.
           _Step(
             number: '1',
-            text: 'Open SmarterSwitch on both phones — and put them on the '
-                'same Wi-Fi network.',
+            text: _useWifiDirect
+                ? 'Open SmarterSwitch on both phones. No shared Wi-Fi '
+                    'network needed — Wi-Fi Direct pairs them peer-to-peer.'
+                : 'Open SmarterSwitch on both phones — and put them on the '
+                    'same Wi-Fi network.',
           ),
           const SizedBox(height: 12),
           _Step(
@@ -327,6 +374,18 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             onPressed: _startAsReceiver,
           ),
           const SizedBox(height: 16),
+          if (_wifiDirectAvailable)
+            Center(
+              child: TextButton(
+                onPressed: () =>
+                    setState(() => _useWifiDirect = !_useWifiDirect),
+                child: Text(
+                  _useWifiDirect
+                      ? 'Already on the same Wi-Fi? Use that instead'
+                      : 'Use Wi-Fi Direct (no shared network needed)',
+                ),
+              ),
+            ),
         ],
       ),
     );

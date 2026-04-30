@@ -30,11 +30,22 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        create("release") {
+            // Committed release keystore — see app/android/keystore/README.md.
+            // The same key signs every build (local and any future remote
+            // agent's), so Obtainium can update across machines without
+            // signature mismatch.
+            storeFile = file("../keystore/release.jks")
+            storePassword = "smarterswitch-dev"
+            keyAlias = "smarterswitch"
+            keyPassword = "smarterswitch-dev"
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
