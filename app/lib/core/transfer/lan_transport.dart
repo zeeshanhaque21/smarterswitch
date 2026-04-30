@@ -3,8 +3,10 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:nsd/nsd.dart' as nsd;
 
+import 'handshake.dart';
 import 'transport.dart';
 import 'wire/frame_codec.dart';
 
@@ -126,6 +128,7 @@ class LanTransport implements Transport {
     await socket.flush();
     final reply = (await session._readHandshakeLine()).trim();
     if (reply == 'OK') {
+      await session._performKeyExchange(pin);
       session._handshakeDone();
       return session;
     }
@@ -157,6 +160,7 @@ class LanTransport implements Transport {
             received.substring(4) == _expectedPin) {
           socket.write('OK\n');
           await socket.flush();
+          await session._performKeyExchange(_expectedPin!);
           session._handshakeDone();
           if (!completer.isCompleted) completer.complete(session);
         } else {
@@ -228,10 +232,63 @@ class _LanSession implements PairedSession {
   final StreamController<Uint8List> _incoming =
       StreamController<Uint8List>.broadcast();
 
+  /// 32-byte symmetric key derived during the post-PIN X25519 exchange.
+  /// All framed messages after handshake are sealed with AES-GCM under
+  /// this key. Wrong PIN ⇒ different key on the two sides ⇒ MAC fails ⇒
+  /// frames silently drop on the receiver.
+  Uint8List? _sessionKey;
+  static final _aes = AesGcm.with256bits();
+
   Future<String> _readHandshakeLine() {
     final c = Completer<String>();
     _readLineCompleter = c;
     return c.future;
+  }
+
+  /// Post-PIN X25519 + HKDF exchange. Each side generates a fresh keypair,
+  /// sends its public key as a `PUBKEY <base64>\n` text line, reads the
+  /// peer's, and derives a shared 32-byte key with the user's PIN as the
+  /// HKDF salt. Wrong PIN ⇒ different keys on the two sides ⇒ AES-GCM
+  /// auth fails on the first sealed frame.
+  Future<void> _performKeyExchange(String pin) async {
+    final keyPair = await Handshake.generate();
+    _socket.write('PUBKEY ${base64.encode(keyPair.publicKeyBytes)}\n');
+    await _socket.flush();
+    final line = (await _readHandshakeLine()).trim();
+    if (!line.startsWith('PUBKEY ')) {
+      throw StateError('Expected PUBKEY, got "$line"');
+    }
+    final peerPub = base64.decode(line.substring('PUBKEY '.length));
+    _sessionKey = await Handshake.deriveSharedKey(
+      myKeyPair: keyPair,
+      peerPublicKey: peerPub,
+      pin: pin,
+    );
+  }
+
+  Future<Uint8List> _seal(Uint8List plaintext, Uint8List key) async {
+    final box = await _aes.encrypt(
+      plaintext,
+      secretKey: SecretKey(key),
+      nonce: _aes.newNonce(),
+    );
+    final out = BytesBuilder()
+      ..add(box.nonce)
+      ..add(box.cipherText)
+      ..add(box.mac.bytes);
+    return out.toBytes();
+  }
+
+  Future<Uint8List> _unseal(Uint8List sealed, Uint8List key) async {
+    if (sealed.length < 28) {
+      throw StateError('Sealed frame too short');
+    }
+    final nonce = sealed.sublist(0, 12);
+    final mac = sealed.sublist(sealed.length - 16);
+    final cipher = sealed.sublist(12, sealed.length - 16);
+    final box = SecretBox(cipher, nonce: nonce, mac: Mac(mac));
+    final plaintext = await _aes.decrypt(box, secretKey: SecretKey(key));
+    return Uint8List.fromList(plaintext);
   }
 
   void _handshakeDone() {
@@ -275,13 +332,32 @@ class _LanSession implements PairedSession {
   @override
   Future<void> sendFrame(Uint8List frame) async {
     // FrameCodec writes a 4-byte big-endian length prefix so the receiver
-    // can reassemble messages regardless of how TCP chunked them.
-    _socket.add(FrameCodec.encode(frame));
+    // can reassemble messages regardless of how TCP chunked them. After
+    // handshake, the frame body is AES-GCM-sealed with the PIN-derived
+    // key so a passive listener on the LAN sees only ciphertext.
+    final key = _sessionKey;
+    final body = key == null ? frame : await _seal(frame, key);
+    _socket.add(FrameCodec.encode(body));
     await _socket.flush();
   }
 
   @override
-  Stream<Uint8List> incomingFrames() => FrameCodec.decode(_incoming.stream);
+  Stream<Uint8List> incomingFrames() async* {
+    await for (final framed in FrameCodec.decode(_incoming.stream)) {
+      final key = _sessionKey;
+      if (key == null) {
+        yield framed;
+        continue;
+      }
+      try {
+        yield await _unseal(framed, key);
+      } catch (_) {
+        // Wrong key (PIN mismatch raced past the handshake check) or
+        // tampered frame — drop it silently. v1.x can tear down the
+        // session on first auth failure.
+      }
+    }
+  }
 
   @override
   String get resumeToken => '';
