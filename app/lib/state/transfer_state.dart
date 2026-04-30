@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/transfer/transport.dart';
 import '../platform/category_counts.dart';
 import 'conflicts.dart';
 
@@ -71,10 +72,21 @@ class TransferState {
     this.categoryStatuses = const {},
     this.conflicts = const [],
     this.conflictDecisions = const {},
+    this.pairedSession,
+    this.transportKind,
   });
 
   final DeviceRole role;
   final String? peerName;
+
+  /// Live session once Pair completes. Held in state so Scan/Transfer/Done
+  /// can read frames from it. Null until Pair succeeds.
+  final PairedSession? pairedSession;
+
+  /// Human-readable label for the transport that paired ("Local Wi-Fi" /
+  /// "Wi-Fi Direct" / "USB-C"). Surfaced in headers so the user knows what
+  /// path they're on.
+  final String? transportKind;
   final Set<DataCategory> selectedCategories;
 
   /// Per-category local probe — counts, permission state, byte estimates.
@@ -101,6 +113,8 @@ class TransferState {
     ScanResult? scanResult,
     List<Conflict>? conflicts,
     Map<int, ConflictDecision>? conflictDecisions,
+    PairedSession? pairedSession,
+    String? transportKind,
   }) =>
       TransferState(
         role: role ?? this.role,
@@ -110,6 +124,8 @@ class TransferState {
         scanResult: scanResult ?? this.scanResult,
         conflicts: conflicts ?? this.conflicts,
         conflictDecisions: conflictDecisions ?? this.conflictDecisions,
+        pairedSession: pairedSession ?? this.pairedSession,
+        transportKind: transportKind ?? this.transportKind,
       );
 }
 
@@ -172,6 +188,26 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
     final next = Map<int, ConflictDecision>.from(state.conflictDecisions);
     next[index] = decision;
     state = state.copyWith(conflictDecisions: next);
+  }
+
+  void setPairedSession({
+    required PairedSession session,
+    required String transportKind,
+    required DeviceRole role,
+  }) {
+    state = state.copyWith(
+      pairedSession: session,
+      transportKind: transportKind,
+      role: role,
+      peerName: session.peerDisplayName,
+    );
+  }
+
+  void clearPairedSession() {
+    state = TransferState(
+      role: state.role,
+      // Drop the session and counts so a new pair starts cleanly.
+    );
   }
 }
 

@@ -92,6 +92,16 @@ class DiscoveredPeer {
   String toString() => 'DiscoveredPeer($displayName, $id, $speedClass)';
 }
 
+/// Thrown by [Transport.connect] when the PIN the sender provided doesn't
+/// match what the receiver is expecting. Distinct from generic connection
+/// errors so the UI can offer a "try again" affordance rather than a full
+/// reset.
+class PinMismatchException implements Exception {
+  const PinMismatchException();
+  @override
+  String toString() => 'PinMismatchException: PIN does not match the receiver';
+}
+
 /// Authenticated, length-prefixed-frame-capable bidirectional channel.
 abstract class PairedSession {
   String get peerDisplayName;

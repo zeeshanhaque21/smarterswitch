@@ -144,12 +144,6 @@ class InMemoryTransport implements Transport {
   }
 }
 
-class PinMismatchException implements Exception {
-  const PinMismatchException();
-  @override
-  String toString() => 'PinMismatchException: PIN does not match the receiver';
-}
-
 class _LoopbackSession implements PairedSession {
   _LoopbackSession._({
     required this.peerDisplayName,

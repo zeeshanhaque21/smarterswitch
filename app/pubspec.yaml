@@ -1,7 +1,7 @@
 name: smarterswitch
 description: "Phone-migration app that merges with deduplication."
 publish_to: 'none'
-version: 0.1.1+2
+version: 0.2.0+3
 
 environment:
   sdk: ^3.11.5
@@ -17,6 +17,8 @@ dependencies:
   args: ^2.5.0
   permission_handler: ^11.3.1
   cryptography: ^2.7.0
+  nsd: ^5.0.1
+  network_info_plus: ^6.1.1
 
 dev_dependencies:
   flutter_test:

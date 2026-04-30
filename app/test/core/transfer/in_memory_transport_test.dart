@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smarterswitch/core/transfer/in_memory_transport.dart';
+import 'package:smarterswitch/core/transfer/transport.dart';
 
 void main() {
   group('InMemoryTransport', () {
