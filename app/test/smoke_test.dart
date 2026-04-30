@@ -7,7 +7,7 @@ void main() {
     await tester.pumpWidget(const ProviderScope(child: SmarterSwitchApp()));
     await tester.pumpAndSettle();
     expect(find.text('SmarterSwitch'), findsOneWidget);
-    expect(find.text('This phone is the SOURCE'), findsOneWidget);
-    expect(find.text('This phone is the TARGET'), findsOneWidget);
+    expect(find.text('OLD phone'), findsOneWidget);
+    expect(find.text('NEW phone'), findsOneWidget);
   });
 }

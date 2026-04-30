@@ -27,6 +27,42 @@ class PairScreen extends ConsumerStatefulWidget {
   ConsumerState<PairScreen> createState() => _PairScreenState();
 }
 
+/// Numbered "Step N: ..." row — used in the role picker so the workflow
+/// reads as a sequence rather than two equally-weighted buttons.
+class _Step extends StatelessWidget {
+  const _Step({required this.number, required this.text});
+  final String number;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        CircleAvatar(
+          radius: 14,
+          backgroundColor: theme.colorScheme.primaryContainer,
+          child: Text(
+            number,
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: theme.colorScheme.onPrimaryContainer,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(text, style: theme.textTheme.bodyMedium),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _PairScreenState extends ConsumerState<PairScreen> {
   _PairPhase _phase = _PairPhase.rolePicker;
   String _statusLine = '';
@@ -223,34 +259,72 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   }
 
   Widget _rolePicker() {
+    final theme = Theme.of(context);
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
           Text(
             'Move data between two phones — without duplicates.',
-            style: Theme.of(context).textTheme.titleLarge,
+            style: theme.textTheme.titleLarge,
           ),
-          const SizedBox(height: 8),
-          Text(
-            'Both phones run this app on the same Wi-Fi network. No cloud, no account.',
-            style: Theme.of(context).textTheme.bodyMedium,
+          const SizedBox(height: 16),
+          // Explicit two-step workflow so users don't think both phones do
+          // the same thing. Same-screen-on-both was confusing in v0.2.0.
+          _Step(
+            number: '1',
+            text: 'Open SmarterSwitch on both phones — and put them on the '
+                'same Wi-Fi network.',
+          ),
+          const SizedBox(height: 12),
+          _Step(
+            number: '2',
+            text: 'On EACH phone, tap a different role below. One phone is '
+                'the OLD phone (the source); the other is the NEW phone '
+                '(the target).',
           ),
           const Spacer(),
+          Text(
+            'What is THIS phone?',
+            style: theme.textTheme.titleMedium,
+          ),
+          const SizedBox(height: 12),
           FilledButton.icon(
-            icon: const Icon(Icons.upload),
-            label: const Text('This phone is the SOURCE'),
+            icon: const Icon(Icons.phone_android),
+            label: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Column(
+                children: [
+                  Text('OLD phone',
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  Text('Has the data — sends to the other phone',
+                      style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
             onPressed: _startAsSender,
           ),
           const SizedBox(height: 16),
           FilledButton.tonalIcon(
-            icon: const Icon(Icons.download),
-            label: const Text('This phone is the TARGET'),
+            icon: const Icon(Icons.phone_iphone),
+            label: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Column(
+                children: [
+                  Text('NEW phone',
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  Text('Receives the data — shows a PIN to type on the old phone',
+                      style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
             onPressed: _startAsReceiver,
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: 16),
         ],
       ),
     );
@@ -264,12 +338,12 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         children: [
           const SizedBox(height: 24),
           Text(
-            'On the other phone, choose SOURCE,',
+            'On the OLD phone, pick this device from the list,',
             style: Theme.of(context).textTheme.bodyLarge,
             textAlign: TextAlign.center,
           ),
           Text(
-            'pick this device, then enter:',
+            'then type this 6-digit PIN:',
             style: Theme.of(context).textTheme.bodyLarge,
             textAlign: TextAlign.center,
           ),
@@ -316,25 +390,39 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         children: [
           const SizedBox(height: 8),
           Text(
-            'Looking for the other phone…',
+            'Looking for the NEW phone…',
             style: Theme.of(context).textTheme.titleMedium,
           ),
           const SizedBox(height: 4),
           Text(
-            'Make sure the other phone is on the same Wi-Fi and showing a 6-digit PIN.',
+            'On the NEW phone, tap "NEW phone" so it starts showing a 6-digit PIN. '
+            'Both phones must be on the same Wi-Fi network.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 16),
           Expanded(
             child: _peers.isEmpty
-                ? const Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        CircularProgressIndicator(),
-                        SizedBox(height: 16),
-                        Text('Searching…'),
-                      ],
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const CircularProgressIndicator(),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Searching…',
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'No phones found yet. The other phone needs to '
+                            'have tapped "NEW phone" and be showing a PIN.',
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
                     ),
                   )
                 : ListView.separated(
