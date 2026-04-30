@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/transfer/manifest.dart';
 import '../core/transfer/transport.dart';
 import '../platform/category_counts.dart';
 import 'conflicts.dart';
@@ -74,6 +75,7 @@ class TransferState {
     this.conflictDecisions = const {},
     this.pairedSession,
     this.transportKind,
+    this.senderManifest,
   });
 
   final DeviceRole role;
@@ -87,6 +89,13 @@ class TransferState {
   /// "Wi-Fi Direct" / "USB-C"). Surfaced in headers so the user knows what
   /// path they're on.
   final String? transportKind;
+
+  /// On the receiver: the manifest sent by the sender after pair, declaring
+  /// what's about to be transferred. Null until the first framed message
+  /// from the peer arrives. On the sender: the manifest the local user
+  /// just sent (we keep a copy so Scan/Transfer can render the same
+  /// numbers on both phones).
+  final TransferManifest? senderManifest;
   final Set<DataCategory> selectedCategories;
 
   /// Per-category local probe — counts, permission state, byte estimates.
@@ -115,6 +124,7 @@ class TransferState {
     Map<int, ConflictDecision>? conflictDecisions,
     PairedSession? pairedSession,
     String? transportKind,
+    TransferManifest? senderManifest,
   }) =>
       TransferState(
         role: role ?? this.role,
@@ -126,6 +136,7 @@ class TransferState {
         conflictDecisions: conflictDecisions ?? this.conflictDecisions,
         pairedSession: pairedSession ?? this.pairedSession,
         transportKind: transportKind ?? this.transportKind,
+        senderManifest: senderManifest ?? this.senderManifest,
       );
 }
 
@@ -208,6 +219,10 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
       role: state.role,
       // Drop the session and counts so a new pair starts cleanly.
     );
+  }
+
+  void setSenderManifest(TransferManifest manifest) {
+    state = state.copyWith(senderManifest: manifest);
   }
 }
 

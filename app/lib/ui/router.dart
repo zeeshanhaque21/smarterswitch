@@ -6,6 +6,7 @@ import 'pair_screen.dart';
 import 'scan_screen.dart';
 import 'select_screen.dart';
 import 'transfer_screen.dart';
+import 'waiting_for_source_screen.dart';
 
 /// 6-step migration flow per ARCHITECTURE.md § ui/.
 final appRouter = GoRouter(
@@ -13,6 +14,10 @@ final appRouter = GoRouter(
   routes: [
     GoRoute(path: '/', builder: (_, _) => const PairScreen()),
     GoRoute(path: '/select', builder: (_, _) => const SelectScreen()),
+    GoRoute(
+      path: '/waiting',
+      builder: (_, _) => const WaitingForSourceScreen(),
+    ),
     GoRoute(path: '/scan', builder: (_, _) => const ScanScreen()),
     GoRoute(
       path: '/conflicts',

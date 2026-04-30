@@ -4,105 +4,127 @@ import 'package:go_router/go_router.dart';
 
 import '../state/transfer_state.dart';
 
-/// Scan screen: in the real flow this is where the receiver indexes its local
-/// data and the sender streams a hash manifest. Phase 1 simulates a result so
-/// the rest of the flow is exercisable end-to-end without a peer.
-class ScanScreen extends ConsumerStatefulWidget {
+/// Per-category preview of what's about to transfer, taken from the
+/// manifest the OLD phone sent to the NEW phone. Same numbers render on
+/// both sides because both are reading the same manifest.
+///
+/// In v1 the receiver's dedup index will run here too and produce the
+/// duplicates/new split per category. v0.2 just shows the source counts —
+/// no dedup yet — so users see exactly what they picked.
+class ScanScreen extends ConsumerWidget {
   const ScanScreen({super.key});
 
   @override
-  ConsumerState<ScanScreen> createState() => _ScanScreenState();
-}
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(transferStateProvider);
+    final manifest = state.senderManifest;
 
-class _ScanScreenState extends ConsumerState<ScanScreen> {
-  bool _scanning = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _runFakeScan();
-  }
-
-  Future<void> _runFakeScan() async {
-    await Future<void>.delayed(const Duration(seconds: 2));
-    if (!mounted) return;
-    ref.read(transferStateProvider.notifier).setScanResult(
-          const ScanResult(
-            sourceTotal: 5234,
-            targetTotal: 4187,
-            duplicates: 4012,
-            newRecords: 1222,
+    if (manifest == null) {
+      // The receiver shouldn't ever reach this screen without a manifest
+      // (the Waiting screen blocks until one arrives), but be defensive.
+      return Scaffold(
+        appBar: AppBar(title: const Text('Scanning')),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'No transfer plan yet. Go back and re-pair.',
+              textAlign: TextAlign.center,
+            ),
           ),
-        );
-    setState(() => _scanning = false);
-  }
+        ),
+      );
+    }
 
-  @override
-  Widget build(BuildContext context) {
-    final scan = ref.watch(transferStateProvider).scanResult;
+    final isReceiver = state.role == DeviceRole.receiver;
+    final headlineLabel = isReceiver
+        ? 'Incoming from ${manifest.senderDisplayName}'
+        : 'About to transfer';
+    final totalItems =
+        manifest.counts.values.fold<int>(0, (a, b) => a + b);
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Scanning')),
+      appBar: AppBar(title: const Text('Review')),
       body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: _scanning || scan == null
-            ? const Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 16),
-                    Text('Hashing local SMS and matching against peer…'),
-                  ],
-                ),
-              )
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _Stat('Source phone', '${scan.sourceTotal} messages'),
-                  _Stat('Target phone (this device)',
-                      '${scan.targetTotal} messages'),
-                  const Divider(),
-                  _Stat('Duplicates (will skip)', '${scan.duplicates}',
-                      emphasis: false),
-                  _Stat('New (will transfer)', '${scan.newRecords}',
-                      emphasis: true),
-                  const Spacer(),
-                  FilledButton(
-                    onPressed: () => context.go('/transfer'),
-                    child: const Text('Start transfer'),
-                  ),
-                ],
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              headlineLabel,
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '$totalItems items across ${manifest.categories.length} categor'
+              '${manifest.categories.length == 1 ? "y" : "ies"}',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: ListView.separated(
+                itemCount: manifest.categories.length,
+                separatorBuilder: (_, _) => const Divider(height: 1),
+                itemBuilder: (_, i) {
+                  final c = manifest.categories[i];
+                  return ListTile(
+                    leading: Icon(_iconFor(c)),
+                    title: Text(_labelFor(c)),
+                    trailing: Text(
+                      '${manifest.counts[c] ?? 0}',
+                      style: const TextStyle(
+                        fontFeatures: [FontFeature.tabularFigures()],
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  );
+                },
               ),
+            ),
+          ],
+        ),
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: FilledButton(
+            onPressed: () => context.go('/transfer'),
+            child: Text(isReceiver
+                ? 'Accept and start transfer'
+                : 'Start transfer'),
+          ),
+        ),
       ),
     );
   }
-}
 
-class _Stat extends StatelessWidget {
-  const _Stat(this.label, this.value, {this.emphasis = false});
-  final String label;
-  final String value;
-  final bool emphasis;
+  IconData _iconFor(DataCategory c) {
+    switch (c) {
+      case DataCategory.sms:
+        return Icons.sms_outlined;
+      case DataCategory.callLog:
+        return Icons.call_outlined;
+      case DataCategory.contacts:
+        return Icons.person_outline;
+      case DataCategory.photos:
+        return Icons.photo_library_outlined;
+      case DataCategory.calendar:
+        return Icons.calendar_today_outlined;
+    }
+  }
 
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: Theme.of(context).textTheme.bodyMedium),
-          Text(
-            value,
-            style: emphasis
-                ? Theme.of(context)
-                    .textTheme
-                    .titleMedium
-                    ?.copyWith(fontWeight: FontWeight.bold)
-                : Theme.of(context).textTheme.titleMedium,
-          ),
-        ],
-      ),
-    );
+  String _labelFor(DataCategory c) {
+    switch (c) {
+      case DataCategory.sms:
+        return 'SMS / MMS';
+      case DataCategory.callLog:
+        return 'Call log';
+      case DataCategory.contacts:
+        return 'Contacts';
+      case DataCategory.photos:
+        return 'Photos & videos';
+      case DataCategory.calendar:
+        return 'Calendar';
+    }
   }
 }

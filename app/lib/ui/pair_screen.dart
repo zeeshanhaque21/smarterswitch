@@ -106,11 +106,13 @@ class _PairScreenState extends ConsumerState<PairScreen> {
             role: DeviceRole.receiver,
           );
       // Hold onto the transport so its server socket stays open for the
-      // session lifetime; the screen handing off to /select doesn't tear
-      // it down.
+      // session lifetime; the screen handing off doesn't tear it down.
       _transport = null;
       setState(() => _phase = _PairPhase.connected);
-      if (mounted) context.go('/select');
+      // The NEW phone waits for the OLD phone to send a manifest. It does
+      // NOT pick categories itself — that was the v0.2.2 bug ("both phones
+      // show as target").
+      if (mounted) context.go('/waiting');
     } catch (e) {
       if (!mounted) return;
       setState(() {

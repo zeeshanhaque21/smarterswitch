@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:nsd/nsd.dart' as nsd;
 
 import 'transport.dart';
+import 'wire/frame_codec.dart';
 
 /// Same-LAN transport over mDNS + raw TCP.
 ///
@@ -273,12 +274,14 @@ class _LanSession implements PairedSession {
 
   @override
   Future<void> sendFrame(Uint8List frame) async {
-    _socket.add(frame);
+    // FrameCodec writes a 4-byte big-endian length prefix so the receiver
+    // can reassemble messages regardless of how TCP chunked them.
+    _socket.add(FrameCodec.encode(frame));
     await _socket.flush();
   }
 
   @override
-  Stream<Uint8List> incomingFrames() => _incoming.stream;
+  Stream<Uint8List> incomingFrames() => FrameCodec.decode(_incoming.stream);
 
   @override
   String get resumeToken => '';

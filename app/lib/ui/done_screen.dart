@@ -9,7 +9,7 @@ class DoneScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final scan = ref.watch(transferStateProvider).scanResult;
+    final manifest = ref.watch(transferStateProvider).senderManifest;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Done'),
@@ -29,19 +29,36 @@ class DoneScreen extends ConsumerWidget {
               style: Theme.of(context).textTheme.headlineMedium,
             ),
             const SizedBox(height: 24),
-            if (scan != null) ...[
-              _Row('Transferred', '${scan.newRecords} new messages'),
-              _Row('Skipped (duplicates)', '${scan.duplicates}'),
-            ],
+            if (manifest != null)
+              for (final c in manifest.categories)
+                _Row(_labelFor(c), '${manifest.counts[c] ?? 0}'),
             const Spacer(),
             FilledButton(
-              onPressed: () => context.go('/'),
+              onPressed: () {
+                ref.read(transferStateProvider.notifier).clearPairedSession();
+                context.go('/');
+              },
               child: const Text('Done'),
             ),
           ],
         ),
       ),
     );
+  }
+
+  static String _labelFor(DataCategory c) {
+    switch (c) {
+      case DataCategory.sms:
+        return 'SMS / MMS';
+      case DataCategory.callLog:
+        return 'Call log';
+      case DataCategory.contacts:
+        return 'Contacts';
+      case DataCategory.photos:
+        return 'Photos & videos';
+      case DataCategory.calendar:
+        return 'Calendar';
+    }
   }
 }
 

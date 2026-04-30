@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../core/transfer/manifest.dart';
 import '../platform/category_counts.dart';
 import '../state/transfer_state.dart';
 
@@ -94,7 +95,7 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: FilledButton(
-            onPressed: canContinue ? () => context.go('/scan') : null,
+            onPressed: canContinue ? _onContinue : null,
             child: Text(
               canContinue
                   ? 'Continue with ${state.selectedCategories.length} categor${state.selectedCategories.length == 1 ? "y" : "ies"}'
@@ -105,6 +106,42 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _onContinue() async {
+    final state = ref.read(transferStateProvider);
+    final notifier = ref.read(transferStateProvider.notifier);
+
+    // Build the manifest from what the user actually picked. The receiver
+    // renders Scan / Transfer / Done off this — it's the wire-level source
+    // of truth for "what we agreed to transfer."
+    final manifest = TransferManifest(
+      senderDisplayName: 'OLD phone',
+      categories: state.selectedCategories.toList()
+        ..sort((a, b) =>
+            kCategoryDisplayOrder.indexOf(a) -
+            kCategoryDisplayOrder.indexOf(b)),
+      counts: {
+        for (final c in state.selectedCategories)
+          c: state.categoryStatuses[c]?.count ?? 0,
+      },
+    );
+    notifier.setSenderManifest(manifest);
+
+    final session = state.pairedSession;
+    if (session != null) {
+      try {
+        await session.sendFrame(manifest.toBytes());
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Send failed: $e')),
+          );
+        }
+        return;
+      }
+    }
+    if (mounted) context.go('/scan');
   }
 
   int _selectedItemTotal(TransferState state) {
