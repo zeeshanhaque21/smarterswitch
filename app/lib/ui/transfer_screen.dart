@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,6 +18,7 @@ import '../core/transfer/transport.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
 import '../platform/contacts_reader.dart';
+import '../platform/media_reader.dart';
 import '../platform/sms_reader.dart';
 import '../state/transfer_state.dart';
 
@@ -135,12 +137,58 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           }
           break;
         case DataCategory.photos:
-          // v0.7: photos need chunked file-byte streaming. Not wired yet.
+          await _streamPhotos(session, () {
+            _processed[category] = (_processed[category] ?? 0) + 1;
+            if (mounted) setState(() {});
+          });
           break;
       }
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
     }
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
+  }
+
+  Future<void> _streamPhotos(
+    PairedSession session,
+    void Function() onFileDone,
+  ) async {
+    final reader = MediaReader();
+    final files = await reader.readMetadata();
+    for (final f in files) {
+      String sha;
+      try {
+        sha = await reader.readSha256(f.uri);
+      } catch (_) {
+        // If a file becomes unreadable mid-walk (deleted, permissions
+        // revoked), skip it and continue with the next.
+        continue;
+      }
+      await session.sendFrame(MediaStartEnvelope(MediaHeader(
+        sha256: sha,
+        fileName: f.fileName,
+        byteSize: f.byteSize,
+        mimeType: f.mimeType,
+        kind: f.kind,
+        takenAtMs: f.takenAtMs,
+      )).toBytes());
+      var offset = 0;
+      while (offset < f.byteSize) {
+        final remaining = f.byteSize - offset;
+        final chunkSize = remaining < MediaReader.chunkBytes
+            ? remaining
+            : MediaReader.chunkBytes;
+        final bytes = await reader.readChunk(f.uri, offset, chunkSize);
+        if (bytes.isEmpty) break;
+        await session.sendFrame(MediaChunkEnvelope(
+          sha256: sha,
+          offset: offset,
+          base64Bytes: base64.encode(bytes),
+        ).toBytes());
+        offset += bytes.length;
+      }
+      await session.sendFrame(MediaEndEnvelope(sha256: sha).toBytes());
+      onFileDone();
+    }
   }
 
   Future<void> _runAsReceiver(
@@ -169,6 +217,20 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final pendingContactWrites = <Contact>[];
     final pendingCalendarWrites = <CalendarEvent>[];
     final pendingSmsWrites = <SmsRecord>[];
+
+    // Photos: streaming-by-sha256. Either we're skipping (sha256 already on
+    // device) or actively writing (MediaStore stream open in Kotlin land).
+    final mediaReader = MediaReader();
+    final localMediaShas =
+        manifest.categories.contains(DataCategory.photos)
+            ? <String>{
+                for (final m in await mediaReader.readMetadata())
+                  await mediaReader.readSha256(m.uri),
+              }
+            : <String>{};
+    String? activeMediaSha;
+    bool skippingActiveMedia = false;
+
     final completer = Completer<void>();
 
     _incomingSub = session.incomingFrames().listen(
@@ -227,6 +289,68 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
               if (mounted) setState(() {});
+              break;
+            case MediaStartEnvelope(:final header):
+              activeMediaSha = header.sha256;
+              if (localMediaShas.contains(header.sha256)) {
+                skippingActiveMedia = true;
+              } else {
+                skippingActiveMedia = false;
+                // Open the receiver-side MediaStore stream. If insert
+                // fails (rare; e.g. storage full), fall back to skipping
+                // — the chunks still come in and just get discarded.
+                mediaReader
+                    .writeStart(
+                  sha256: header.sha256,
+                  fileName: header.fileName,
+                  mimeType: header.mimeType,
+                  kind: header.kind,
+                  takenAtMs: header.takenAtMs,
+                )
+                    .then((opened) {
+                  if (!opened) {
+                    skippingActiveMedia = true;
+                  }
+                });
+              }
+              break;
+            case MediaChunkEnvelope(
+                  :final sha256,
+                  :final base64Bytes,
+                ):
+              if (sha256 != activeMediaSha) break;
+              if (skippingActiveMedia) break;
+              final bytes = base64.decode(base64Bytes);
+              mediaReader.writeChunk(sha256, bytes);
+              break;
+            case MediaEndEnvelope(:final sha256):
+              if (sha256 == activeMediaSha) {
+                if (skippingActiveMedia) {
+                  _skippedByCategory[DataCategory.photos] =
+                      (_skippedByCategory[DataCategory.photos] ?? 0) + 1;
+                } else {
+                  // Close the stream + clear IS_PENDING. Once this resolves
+                  // the file is visible to the gallery.
+                  mediaReader.writeEnd(sha256).then((ok) {
+                    if (ok) {
+                      _writtenByCategory[DataCategory.photos] =
+                          (_writtenByCategory[DataCategory.photos] ?? 0) + 1;
+                      // Add to local dedup set so a re-streamed copy in
+                      // the same session doesn't double-write.
+                      localMediaShas.add(sha256);
+                    } else {
+                      _skippedByCategory[DataCategory.photos] =
+                          (_skippedByCategory[DataCategory.photos] ?? 0) +
+                              1;
+                    }
+                    if (mounted) setState(() {});
+                  });
+                }
+                _processed[DataCategory.photos] =
+                    (_processed[DataCategory.photos] ?? 0) + 1;
+                activeMediaSha = null;
+                if (mounted) setState(() {});
+              }
               break;
             case CategoryDoneEnvelope(:final category):
               switch (category) {
@@ -412,11 +536,9 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final progress = total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0);
     final role = ref.read(transferStateProvider).role;
     final isReceiver = role == DeviceRole.receiver;
-    final hasWriter = c == DataCategory.sms ||
-        c == DataCategory.callLog ||
-        c == DataCategory.contacts ||
-        c == DataCategory.calendar;
-    final detail = isReceiver && hasWriter
+    // All five categories have writers as of v0.7; receiver always shows
+    // the new/duplicate breakdown.
+    final detail = isReceiver
         ? '$done / $total received '
             '(${_writtenByCategory[c] ?? 0} new, '
             '${_skippedByCategory[c] ?? 0} duplicates)'

@@ -5,6 +5,7 @@ import '../../state/transfer_state.dart';
 import '../model/calendar_event.dart';
 import '../model/call_log_record.dart';
 import '../model/contact.dart';
+import '../model/media_record.dart';
 import '../model/sms_record.dart';
 
 /// Sender-side declaration of what's about to be transferred. Sent as the
@@ -93,6 +94,18 @@ sealed class TransferEnvelope {
         return SmsRecordEnvelope(
           SmsRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
         );
+      case 'media_start':
+        return MediaStartEnvelope(
+          MediaHeaderCodec.fromJson(raw['header'] as Map<String, dynamic>),
+        );
+      case 'media_chunk':
+        return MediaChunkEnvelope(
+          sha256: raw['sha256'] as String,
+          offset: (raw['offset'] as num).toInt(),
+          base64Bytes: raw['bytes'] as String,
+        );
+      case 'media_end':
+        return MediaEndEnvelope(sha256: raw['sha256'] as String);
       case 'contact_record':
         return ContactRecordEnvelope(
           ContactCodec.fromJson(raw['record'] as Map<String, dynamic>),
@@ -140,6 +153,88 @@ class SmsRecordEnvelope extends TransferEnvelope {
         'kind': 'sms_record',
         'record': SmsRecordCodec.toJson(record),
       })));
+}
+
+/// Header for one photo / video about to stream. Followed by N
+/// MediaChunkEnvelope frames and finally a MediaEndEnvelope. The receiver
+/// can short-circuit on sha256 match — sender still streams chunks (the
+/// receiver discards them) so we don't need a bidirectional skip protocol
+/// in v0.7. Bandwidth waste on duplicates is the trade-off; v0.8 adds a
+/// pre-flight hash manifest.
+class MediaStartEnvelope extends TransferEnvelope {
+  MediaStartEnvelope(this.header);
+  final MediaHeader header;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'media_start',
+        'header': MediaHeaderCodec.toJson(header),
+      })));
+}
+
+class MediaChunkEnvelope extends TransferEnvelope {
+  MediaChunkEnvelope({
+    required this.sha256,
+    required this.offset,
+    required this.base64Bytes,
+  });
+  final String sha256;
+  final int offset;
+  final String base64Bytes;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'media_chunk',
+        'sha256': sha256,
+        'offset': offset,
+        'bytes': base64Bytes,
+      })));
+}
+
+class MediaEndEnvelope extends TransferEnvelope {
+  MediaEndEnvelope({required this.sha256});
+  final String sha256;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'media_end',
+        'sha256': sha256,
+      })));
+}
+
+class MediaHeader {
+  const MediaHeader({
+    required this.sha256,
+    required this.fileName,
+    required this.byteSize,
+    required this.mimeType,
+    required this.kind,
+    this.takenAtMs,
+  });
+  final String sha256;
+  final String fileName;
+  final int byteSize;
+  final String mimeType;
+  final MediaKind kind;
+  final int? takenAtMs;
+}
+
+class MediaHeaderCodec {
+  static Map<String, dynamic> toJson(MediaHeader h) => {
+        'sha256': h.sha256,
+        'fileName': h.fileName,
+        'byteSize': h.byteSize,
+        'mimeType': h.mimeType,
+        'kind': h.kind == MediaKind.video ? 'video' : 'image',
+        'takenAtMs': h.takenAtMs,
+      };
+
+  static MediaHeader fromJson(Map<String, dynamic> m) => MediaHeader(
+        sha256: m['sha256'] as String,
+        fileName: m['fileName'] as String? ?? '',
+        byteSize: (m['byteSize'] as num?)?.toInt() ?? 0,
+        mimeType: m['mimeType'] as String? ?? 'application/octet-stream',
+        kind:
+            (m['kind'] as String?) == 'video' ? MediaKind.video : MediaKind.image,
+        takenAtMs: (m['takenAtMs'] as num?)?.toInt(),
+      );
 }
 
 class ContactRecordEnvelope extends TransferEnvelope {

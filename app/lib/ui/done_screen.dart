@@ -73,15 +73,8 @@ class DoneScreen extends ConsumerWidget {
     final written = state.writtenByCategory[c] ?? 0;
     final skipped = state.skippedByCategory[c] ?? 0;
     final total = manifest.counts[c] ?? 0;
-    final hasWriter = c == DataCategory.sms ||
-        c == DataCategory.callLog ||
-        c == DataCategory.contacts ||
-        c == DataCategory.calendar;
-    if (hasWriter) {
-      return '$written new, $skipped duplicates skipped (of $total)';
-    }
-    // Other categories: writers not yet implemented.
-    return '$total received (writer arrives in a later release)';
+    // All five categories have writers as of v0.7.
+    return '$written new, $skipped duplicates skipped (of $total)';
   }
 
   static String _labelFor(DataCategory c) {

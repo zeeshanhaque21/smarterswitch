@@ -3,8 +3,8 @@ import 'package:permission_handler/permission_handler.dart';
 import '../state/transfer_state.dart';
 import 'calendar_reader.dart';
 import 'call_log_reader.dart';
-import 'category_channels.dart';
 import 'contacts_reader.dart';
+import 'media_reader.dart';
 import 'sms_reader.dart';
 
 /// Probes counts and permission state for all five data categories in
