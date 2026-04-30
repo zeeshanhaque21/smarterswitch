@@ -1,5 +1,6 @@
 package com.smarterswitch.app
 
+import android.content.Intent
 import com.smarterswitch.app.native.CalendarChannel
 import com.smarterswitch.app.native.CallLogChannel
 import com.smarterswitch.app.native.ContactsChannel
@@ -16,5 +17,15 @@ class MainActivity : FlutterActivity() {
         ContactsChannel.register(flutterEngine, this)
         MediaChannel.register(flutterEngine, this)
         CalendarChannel.register(flutterEngine, this)
+    }
+
+    @Deprecated("Required to forward role-grab results to SmsChannel")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+        SmsChannel.handleActivityResult(this, requestCode, resultCode)
     }
 }

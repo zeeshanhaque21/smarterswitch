@@ -34,6 +34,10 @@ class DoneScreen extends ConsumerWidget {
             ),
             const SizedBox(height: 24),
             if (manifest != null) ..._categoryRows(state, manifest),
+            if (state.previousSmsAppPackage != null && isReceiver) ...[
+              const SizedBox(height: 24),
+              _SmsRestoreBanner(previousPackage: state.previousSmsAppPackage!),
+            ],
             const Spacer(),
             FilledButton(
               onPressed: () {
@@ -69,7 +73,8 @@ class DoneScreen extends ConsumerWidget {
     final written = state.writtenByCategory[c] ?? 0;
     final skipped = state.skippedByCategory[c] ?? 0;
     final total = manifest.counts[c] ?? 0;
-    final hasWriter = c == DataCategory.callLog ||
+    final hasWriter = c == DataCategory.sms ||
+        c == DataCategory.callLog ||
         c == DataCategory.contacts ||
         c == DataCategory.calendar;
     if (hasWriter) {
@@ -92,6 +97,53 @@ class DoneScreen extends ConsumerWidget {
       case DataCategory.calendar:
         return 'Calendar';
     }
+  }
+}
+
+/// Banner the receiver shows when SmarterSwitch grabbed the default-SMS-app
+/// role to write incoming messages. Android doesn't let us programmatically
+/// hand the role back, so we tell the user which app they were using before
+/// — opening it is usually enough; most SMS apps prompt to be default again
+/// on launch.
+class _SmsRestoreBanner extends StatelessWidget {
+  const _SmsRestoreBanner({required this.previousPackage});
+  final String previousPackage;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      color: theme.colorScheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.info_outline,
+                    color: theme.colorScheme.onTertiaryContainer),
+                const SizedBox(width: 12),
+                Text(
+                  'SmarterSwitch is your default SMS app.',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: theme.colorScheme.onTertiaryContainer,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Open $previousPackage (or go to Settings → Default apps → SMS app) '
+              'to switch the role back.',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onTertiaryContainer,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

@@ -5,6 +5,7 @@ import '../../state/transfer_state.dart';
 import '../model/calendar_event.dart';
 import '../model/call_log_record.dart';
 import '../model/contact.dart';
+import '../model/sms_record.dart';
 
 /// Sender-side declaration of what's about to be transferred. Sent as the
 /// first framed message after pairing. The receiver uses this to:
@@ -88,6 +89,10 @@ sealed class TransferEnvelope {
         return CallLogRecordEnvelope(
           CallLogRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
         );
+      case 'sms_record':
+        return SmsRecordEnvelope(
+          SmsRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
+        );
       case 'contact_record':
         return ContactRecordEnvelope(
           ContactCodec.fromJson(raw['record'] as Map<String, dynamic>),
@@ -124,6 +129,16 @@ class CallLogRecordEnvelope extends TransferEnvelope {
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'call_log_record',
         'record': CallLogRecordCodec.toJson(record),
+      })));
+}
+
+class SmsRecordEnvelope extends TransferEnvelope {
+  SmsRecordEnvelope(this.record);
+  final SmsRecord record;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'sms_record',
+        'record': SmsRecordCodec.toJson(record),
       })));
 }
 
@@ -183,6 +198,34 @@ class CallLogRecordCodec {
           orElse: () => CallDirection.incoming,
         ),
         cachedName: m['cachedName'] as String?,
+      );
+}
+
+class SmsRecordCodec {
+  static Map<String, dynamic> toJson(SmsRecord r) => {
+        'address': r.address,
+        'body': r.body,
+        'timestampMs': r.timestampMs,
+        'type': r.type.name,
+        'threadId': r.threadId,
+        // mmsParts is part of the model but not yet wired through the
+        // platform reader; carry it on the wire so v0.7+ MMS work doesn't
+        // need a schema change.
+        'mmsParts': r.mmsParts,
+      };
+
+  static SmsRecord fromJson(Map<String, dynamic> m) => SmsRecord(
+        address: m['address'] as String? ?? '',
+        body: m['body'] as String? ?? '',
+        timestampMs: (m['timestampMs'] as num?)?.toInt() ?? 0,
+        type: SmsType.values.firstWhere(
+          (t) => t.name == m['type'],
+          orElse: () => SmsType.inbox,
+        ),
+        threadId: (m['threadId'] as num?)?.toInt(),
+        mmsParts: ((m['mmsParts'] as List<dynamic>?) ?? const [])
+            .cast<String>()
+            .toList(growable: false),
       );
 }
 

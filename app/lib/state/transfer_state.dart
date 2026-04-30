@@ -78,6 +78,7 @@ class TransferState {
     this.senderManifest,
     this.writtenByCategory = const {},
     this.skippedByCategory = const {},
+    this.previousSmsAppPackage,
   });
 
   final DeviceRole role;
@@ -106,6 +107,12 @@ class TransferState {
 
   /// Receiver-side tally of records skipped as duplicates per category.
   final Map<DataCategory, int> skippedByCategory;
+
+  /// Package name of the SMS app that was default before SmarterSwitch
+  /// grabbed the role. Surfaced on the Done screen so the user knows which
+  /// app to open to take the default-SMS role back — Android doesn't let
+  /// us programmatically restore it.
+  final String? previousSmsAppPackage;
   final Set<DataCategory> selectedCategories;
 
   /// Per-category local probe — counts, permission state, byte estimates.
@@ -137,6 +144,7 @@ class TransferState {
     TransferManifest? senderManifest,
     Map<DataCategory, int>? writtenByCategory,
     Map<DataCategory, int>? skippedByCategory,
+    String? previousSmsAppPackage,
   }) =>
       TransferState(
         role: role ?? this.role,
@@ -151,6 +159,8 @@ class TransferState {
         senderManifest: senderManifest ?? this.senderManifest,
         writtenByCategory: writtenByCategory ?? this.writtenByCategory,
         skippedByCategory: skippedByCategory ?? this.skippedByCategory,
+        previousSmsAppPackage:
+            previousSmsAppPackage ?? this.previousSmsAppPackage,
       );
 }
 
@@ -247,6 +257,10 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
       writtenByCategory: Map<DataCategory, int>.from(written),
       skippedByCategory: Map<DataCategory, int>.from(skipped),
     );
+  }
+
+  void setPreviousSmsAppPackage(String pkg) {
+    state = state.copyWith(previousSmsAppPackage: pkg);
   }
 }
 

@@ -7,14 +7,17 @@ import 'package:go_router/go_router.dart';
 import '../core/dedup/calendar_dedup.dart';
 import '../core/dedup/call_log_dedup.dart';
 import '../core/dedup/contacts_dedup.dart';
+import '../core/dedup/sms_dedup.dart';
 import '../core/model/calendar_event.dart';
 import '../core/model/call_log_record.dart';
 import '../core/model/contact.dart';
+import '../core/model/sms_record.dart';
 import '../core/transfer/manifest.dart';
 import '../core/transfer/transport.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
 import '../platform/contacts_reader.dart';
+import '../platform/sms_reader.dart';
 import '../state/transfer_state.dart';
 
 /// Real per-category transfer.
@@ -95,6 +98,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     for (final category in manifest.categories) {
       _processed[category] = 0;
       switch (category) {
+        case DataCategory.sms:
+          final records = await SmsReader().readAll();
+          for (final r in records) {
+            await session.sendFrame(SmsRecordEnvelope(r).toBytes());
+            _processed[category] = (_processed[category] ?? 0) + 1;
+            if (mounted) setState(() {});
+          }
+          break;
         case DataCategory.callLog:
           final records = await CallLogReader().readAll();
           for (final r in records) {
@@ -123,10 +134,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             if (mounted) setState(() {});
           }
           break;
-        case DataCategory.sms:
         case DataCategory.photos:
-          // v0.5: SMS needs the default-SMS-app role grab; photos need
-          // chunked file-byte streaming. Wired in later releases.
+          // v0.7: photos need chunked file-byte streaming. Not wired yet.
           break;
       }
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
@@ -152,10 +161,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final calendarIndex = manifest.categories.contains(DataCategory.calendar)
         ? CalendarDedup.indexOf(await CalendarReader().readAll())
         : <CalendarDedupKey>{};
+    final smsIndex = manifest.categories.contains(DataCategory.sms)
+        ? SmsDedup.indexOf(await SmsReader().readAll())
+        : <SmsDedupKey>{};
 
     final pendingCallLogWrites = <CallLogRecord>[];
     final pendingContactWrites = <Contact>[];
     final pendingCalendarWrites = <CalendarEvent>[];
+    final pendingSmsWrites = <SmsRecord>[];
     final completer = Completer<void>();
 
     _incomingSub = session.incomingFrames().listen(
@@ -166,6 +179,17 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             case ManifestEnvelope():
               // Already handled at the WaitingForSourceScreen step; ignore
               // a duplicate here.
+              break;
+            case SmsRecordEnvelope(:final record):
+              if (SmsDedup.isDuplicate(smsIndex, record)) {
+                _skippedByCategory[DataCategory.sms] =
+                    (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
+              } else {
+                pendingSmsWrites.add(record);
+              }
+              _processed[DataCategory.sms] =
+                  (_processed[DataCategory.sms] ?? 0) + 1;
+              if (mounted) setState(() {});
               break;
             case CallLogRecordEnvelope(:final record):
               if (CallLogDedup.isDuplicate(callLogIndex, record)) {
@@ -206,6 +230,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               break;
             case CategoryDoneEnvelope(:final category):
               switch (category) {
+                case DataCategory.sms:
+                  // SMS write is gated on becoming the default SMS app.
+                  // Keep the listener alive and handle the role-grab +
+                  // write asynchronously; the rest of the protocol
+                  // continues in parallel for other categories.
+                  _flushSmsBatchAsync(pendingSmsWrites);
+                  break;
                 case DataCategory.callLog:
                   _flushBatch<CallLogRecord>(
                     pending: pendingCallLogWrites,
@@ -227,9 +258,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                     category: DataCategory.calendar,
                   );
                   break;
-                case DataCategory.sms:
                 case DataCategory.photos:
-                  // No writer wired yet for these; nothing to flush.
+                  // No writer wired yet.
                   break;
               }
               break;
@@ -252,6 +282,48 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     );
 
     await completer.future;
+  }
+
+  /// Flush the SMS batch via the default-SMS-app role grab dance:
+  /// 1) Confirm we still have at least one record to write — otherwise skip
+  ///    the role intrusion entirely.
+  /// 2) Request the role; the system shows a "Set as default SMS app"
+  ///    dialog. If the user denies, we mark all pending as skipped and
+  ///    move on (transfer continues for the other categories).
+  /// 3) Write the records via SmsReader.writeAll. The Done screen will
+  ///    surface the previous-default-package so the user knows which app
+  ///    to open to switch back.
+  Future<void> _flushSmsBatchAsync(List<SmsRecord> pending) async {
+    if (pending.isEmpty) return;
+    final batch = List<SmsRecord>.from(pending);
+    pending.clear();
+    final reader = SmsReader();
+    final previousDefault = await reader.getDefaultSmsPackage();
+    final granted =
+        await reader.isDefaultSmsApp() || await reader.requestSmsRole();
+    if (!granted) {
+      _skippedByCategory[DataCategory.sms] =
+          (_skippedByCategory[DataCategory.sms] ?? 0) + batch.length;
+      if (mounted) setState(() {});
+      return;
+    }
+    try {
+      final written = await reader.writeAll(batch);
+      _writtenByCategory[DataCategory.sms] =
+          (_writtenByCategory[DataCategory.sms] ?? 0) + written;
+      // Stash the previous default so the Done screen can tell the user
+      // which app to open to take the role back.
+      if (mounted && previousDefault != null) {
+        ref
+            .read(transferStateProvider.notifier)
+            .setPreviousSmsAppPackage(previousDefault);
+      }
+    } catch (_) {
+      // If the write fails wholesale, treat the batch as skipped.
+      _skippedByCategory[DataCategory.sms] =
+          (_skippedByCategory[DataCategory.sms] ?? 0) + batch.length;
+    }
+    if (mounted) setState(() {});
   }
 
   // -------------------------------------------------------- Per-cat flush
@@ -340,7 +412,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final progress = total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0);
     final role = ref.read(transferStateProvider).role;
     final isReceiver = role == DeviceRole.receiver;
-    final hasWriter = c == DataCategory.callLog ||
+    final hasWriter = c == DataCategory.sms ||
+        c == DataCategory.callLog ||
         c == DataCategory.contacts ||
         c == DataCategory.calendar;
     final detail = isReceiver && hasWriter
