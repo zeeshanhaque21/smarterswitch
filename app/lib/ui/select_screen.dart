@@ -19,11 +19,32 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _runProbe());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _requestAllAndProbe());
   }
 
-  Future<void> _runProbe() async {
+  /// Request every permission the five categories need in one batch, then
+  /// probe counts. permission_handler short-circuits already-decided
+  /// permissions (granted / permanently denied), so re-entering the screen
+  /// after the user has answered doesn't re-prompt.
+  ///
+  /// Without this, a fresh install lands on the Select screen with all five
+  /// rows showing "Tap to allow" and the bottom CTA reading "0 items"
+  /// because counts can't be queried without permission.
+  ///
+  /// Skipped when state is already populated — that means either a
+  /// re-navigation (we already have counts; just refresh) or a test with
+  /// seeded state (where the platform channels would hang).
+  Future<void> _requestAllAndProbe() async {
     setState(() => _probing = true);
+    final alreadyHaveData =
+        ref.read(transferStateProvider).categoryStatuses.isNotEmpty;
+    if (!alreadyHaveData) {
+      final allPermissions = <Permission>{
+        for (final c in kCategoryDisplayOrder) ...permissionsFor(c),
+      };
+      await Future.wait(allPermissions.map((p) => p.request()));
+      if (!mounted) return;
+    }
     await ref.read(transferStateProvider.notifier).probeAllCategoryCounts();
     if (mounted) setState(() => _probing = false);
   }
