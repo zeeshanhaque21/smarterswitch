@@ -226,9 +226,20 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       });
     } catch (e) {
       if (!mounted) return;
+      // Connection-refused / no-route-to-host on a Wi-Fi Direct interface
+      // address means we're hitting a stale P2P advertisement. v0.13.1
+      // filters those at discovery time, but if anything slips through,
+      // surface a hint so the user knows what to clear.
+      final msg = e.toString();
+      final hint = msg.contains('Connection refused') ||
+              msg.contains('No route to host')
+          ? '\n\nIf this keeps happening: open Settings → Wi-Fi → Wi-Fi '
+              'Direct, disconnect any peers, then force-stop SmarterSwitch '
+              'on both phones and try again.'
+          : '';
       setState(() {
         _phase = _PairPhase.error;
-        _errorMessage = 'Connection failed: $e';
+        _errorMessage = 'Connection failed: $e$hint';
       });
     }
   }

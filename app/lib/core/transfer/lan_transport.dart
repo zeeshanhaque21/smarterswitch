@@ -58,6 +58,13 @@ class LanTransport implements Transport {
         final host = resolved.host;
         final port = resolved.port;
         if (host == null || port == null) continue;
+        // Skip Wi-Fi Direct interface IPs (192.168.49.0/24). When the
+        // receiver is bound to all interfaces and a P2P group is up
+        // (or recently was), NSD will sometimes publish the P2P
+        // address — but the sender isn't in that group, so the connect
+        // fails with errno=111. Real same-Wi-Fi peers are on the
+        // router's subnet, not the P2P one.
+        if (host.startsWith('192.168.49.')) continue;
         final id = '$host:$port';
         if (!yieldedIds.add(id)) continue;
         controller.add(DiscoveredPeer(
