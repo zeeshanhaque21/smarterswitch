@@ -55,6 +55,15 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   StreamSubscription? _incomingSub;
   final _foreground = ForegroundService();
 
+  /// Number of photos sender has hashed pre-flight. Surfaced as the
+  /// "Hashing N / total" line during the pre-flight pass.
+  int _hashed = 0;
+
+  /// Number of photos the receiver said to skip via PhotoSkipListEnvelope.
+  /// Used in Done-screen reporting and the progress label so the user
+  /// understands why the byte total is less than what they have.
+  int _photosSkippedPreflight = 0;
+
   @override
   void initState() {
     super.initState();
@@ -170,13 +179,59 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   ) async {
     final reader = MediaReader();
     final files = await reader.readMetadata();
+
+    // Pre-flight pass: hash every photo before any bytes go out, so we can
+    // ask the receiver which it already has. The hash pass is the long
+    // pole on a 30k-photo library (~2 minutes); progress is exposed to
+    // the user via the Hashing column.
+    final hashed = <String, MediaMetadata>{};
     for (final f in files) {
-      String sha;
       try {
-        sha = await reader.readSha256(f.uri);
+        final sha = await reader.readSha256(f.uri);
+        if (!hashed.containsKey(sha)) {
+          hashed[sha] = f;
+        }
+        _hashed += 1;
+        if (mounted) setState(() {});
       } catch (_) {
-        // If a file becomes unreadable mid-walk (deleted, permissions
-        // revoked), skip it and continue with the next.
+        // File became unreadable (deleted, permission revoked) — skip.
+      }
+    }
+
+    // Send the hashes; await the receiver's skip list.
+    await session.sendFrame(PhotoHashesEnvelope(
+      hashes: hashed.keys.toList(growable: false),
+    ).toBytes());
+    final skipSet = <String>{};
+    final waitForSkip = Completer<void>();
+    final sub = session.incomingFrames().listen((frame) {
+      try {
+        final env = TransferEnvelope.fromBytes(frame);
+        if (env is PhotoSkipListEnvelope) {
+          skipSet.addAll(env.skip);
+          if (!waitForSkip.isCompleted) waitForSkip.complete();
+        }
+      } catch (_) {/* not for us */}
+    });
+    try {
+      await waitForSkip.future.timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      // Receiver didn't reply — assume nothing to skip and stream
+      // everything (back-compat with v0.7-and-older receivers).
+    }
+    await sub.cancel();
+
+    _photosSkippedPreflight = skipSet.length;
+    if (mounted) setState(() {});
+
+    for (final entry in hashed.entries) {
+      final sha = entry.key;
+      final f = entry.value;
+      if (skipSet.contains(sha)) {
+        // Sender side counts the skip too so the per-category progress
+        // bar reflects "we've handled this file even though we didn't
+        // send bytes."
+        onFileDone();
         continue;
       }
       await session.sendFrame(MediaStartEnvelope(MediaHeader(
@@ -305,6 +360,26 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
               if (mounted) setState(() {});
+              break;
+            case PhotoHashesEnvelope(:final hashes):
+              // Receiver: reply with which sha256s are already on this
+              // device so the sender doesn't waste bandwidth on dupes.
+              final skip = hashes
+                  .where(localMediaShas.contains)
+                  .toList(growable: false);
+              session
+                  .sendFrame(PhotoSkipListEnvelope(skip: skip).toBytes())
+                  .catchError((Object _) {});
+              // Also pre-credit the skipped count to the per-category
+              // tally so the UI reflects the eventual outcome.
+              _skippedByCategory[DataCategory.photos] =
+                  (_skippedByCategory[DataCategory.photos] ?? 0) + skip.length;
+              if (mounted) setState(() {});
+              break;
+            case PhotoSkipListEnvelope():
+              // Receiver-side, this should never arrive. Sender-side, the
+              // _streamPhotos local subscription consumes it; if we land
+              // here it's stray.
               break;
             case MediaStartEnvelope(:final header):
               activeMediaSha = header.sha256;
@@ -552,13 +627,22 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final progress = total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0);
     final role = ref.read(transferStateProvider).role;
     final isReceiver = role == DeviceRole.receiver;
+    final isSenderHashingPhotos =
+        !isReceiver && c == DataCategory.photos && _hashed > 0 && done == 0;
+
     // All five categories have writers as of v0.7; receiver always shows
-    // the new/duplicate breakdown.
-    final detail = isReceiver
-        ? '$done / $total received '
-            '(${_writtenByCategory[c] ?? 0} new, '
-            '${_skippedByCategory[c] ?? 0} duplicates)'
-        : '$done / $total';
+    // the new/duplicate breakdown. The sender shows a hashing-phase
+    // status for photos, then progresses to bytes-sent once chunks flow.
+    final detail = isSenderHashingPhotos
+        ? 'Hashing $_hashed / $total'
+        : isReceiver
+            ? '$done / $total received '
+                '(${_writtenByCategory[c] ?? 0} new, '
+                '${_skippedByCategory[c] ?? 0} duplicates)'
+            : c == DataCategory.photos && _photosSkippedPreflight > 0
+                ? '$done / $total sent '
+                    '($_photosSkippedPreflight skipped — already on the other phone)'
+                : '$done / $total';
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(

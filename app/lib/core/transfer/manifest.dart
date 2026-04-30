@@ -106,6 +106,18 @@ sealed class TransferEnvelope {
         );
       case 'media_end':
         return MediaEndEnvelope(sha256: raw['sha256'] as String);
+      case 'photo_hashes':
+        return PhotoHashesEnvelope(
+          hashes: ((raw['hashes'] as List<dynamic>?) ?? const [])
+              .cast<String>()
+              .toList(growable: false),
+        );
+      case 'photo_skip_list':
+        return PhotoSkipListEnvelope(
+          skip: ((raw['skip'] as List<dynamic>?) ?? const [])
+              .cast<String>()
+              .toList(growable: false),
+        );
       case 'contact_record':
         return ContactRecordEnvelope(
           ContactCodec.fromJson(raw['record'] as Map<String, dynamic>),
@@ -196,6 +208,30 @@ class MediaEndEnvelope extends TransferEnvelope {
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'media_end',
         'sha256': sha256,
+      })));
+}
+
+/// Pre-flight hash list from sender → receiver, before any photo bytes
+/// flow. Receiver replies with [PhotoSkipListEnvelope] naming the hashes
+/// it already has; sender then streams only the misses, eliminating the
+/// duplicate-bandwidth waste that v0.7 had.
+class PhotoHashesEnvelope extends TransferEnvelope {
+  PhotoHashesEnvelope({required this.hashes});
+  final List<String> hashes;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'photo_hashes',
+        'hashes': hashes,
+      })));
+}
+
+class PhotoSkipListEnvelope extends TransferEnvelope {
+  PhotoSkipListEnvelope({required this.skip});
+  final List<String> skip;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'photo_skip_list',
+        'skip': skip,
       })));
 }
 
