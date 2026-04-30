@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../core/transfer/manifest.dart';
 import '../state/transfer_state.dart';
 
 class DoneScreen extends ConsumerWidget {
@@ -9,7 +10,10 @@ class DoneScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final manifest = ref.watch(transferStateProvider).senderManifest;
+    final state = ref.watch(transferStateProvider);
+    final manifest = state.senderManifest;
+    final isReceiver = state.role == DeviceRole.receiver;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Done'),
@@ -24,14 +28,12 @@ class DoneScreen extends ConsumerWidget {
             const Icon(Icons.check_circle, size: 96, color: Colors.green),
             const SizedBox(height: 16),
             Text(
-              'Transfer complete',
+              isReceiver ? 'Transfer received' : 'Transfer sent',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.headlineMedium,
             ),
             const SizedBox(height: 24),
-            if (manifest != null)
-              for (final c in manifest.categories)
-                _Row(_labelFor(c), '${manifest.counts[c] ?? 0}'),
+            if (manifest != null) ..._categoryRows(state, manifest),
             const Spacer(),
             FilledButton(
               onPressed: () {
@@ -44,6 +46,34 @@ class DoneScreen extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  List<Widget> _categoryRows(TransferState state, TransferManifest manifest) {
+    final isReceiver = state.role == DeviceRole.receiver;
+    return [
+      for (final c in manifest.categories)
+        _Row(
+          _labelFor(c),
+          isReceiver
+              ? _receiverDetail(c, state, manifest)
+              : '${manifest.counts[c] ?? 0} sent',
+        ),
+    ];
+  }
+
+  String _receiverDetail(
+    DataCategory c,
+    TransferState state,
+    TransferManifest manifest,
+  ) {
+    final written = state.writtenByCategory[c] ?? 0;
+    final skipped = state.skippedByCategory[c] ?? 0;
+    final total = manifest.counts[c] ?? 0;
+    if (c == DataCategory.callLog) {
+      return '$written new, $skipped duplicates skipped (of $total)';
+    }
+    // Other categories: writers not yet implemented.
+    return '$total received (writer arrives in a later release)';
   }
 
   static String _labelFor(DataCategory c) {

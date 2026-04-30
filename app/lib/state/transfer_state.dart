@@ -76,6 +76,8 @@ class TransferState {
     this.pairedSession,
     this.transportKind,
     this.senderManifest,
+    this.writtenByCategory = const {},
+    this.skippedByCategory = const {},
   });
 
   final DeviceRole role;
@@ -96,6 +98,14 @@ class TransferState {
   /// just sent (we keep a copy so Scan/Transfer can render the same
   /// numbers on both phones).
   final TransferManifest? senderManifest;
+
+  /// Receiver-side tally of records actually written per category, after
+  /// dedup. Surfaced on the Done screen so the user knows what really
+  /// landed.
+  final Map<DataCategory, int> writtenByCategory;
+
+  /// Receiver-side tally of records skipped as duplicates per category.
+  final Map<DataCategory, int> skippedByCategory;
   final Set<DataCategory> selectedCategories;
 
   /// Per-category local probe — counts, permission state, byte estimates.
@@ -125,6 +135,8 @@ class TransferState {
     PairedSession? pairedSession,
     String? transportKind,
     TransferManifest? senderManifest,
+    Map<DataCategory, int>? writtenByCategory,
+    Map<DataCategory, int>? skippedByCategory,
   }) =>
       TransferState(
         role: role ?? this.role,
@@ -137,6 +149,8 @@ class TransferState {
         pairedSession: pairedSession ?? this.pairedSession,
         transportKind: transportKind ?? this.transportKind,
         senderManifest: senderManifest ?? this.senderManifest,
+        writtenByCategory: writtenByCategory ?? this.writtenByCategory,
+        skippedByCategory: skippedByCategory ?? this.skippedByCategory,
       );
 }
 
@@ -223,6 +237,16 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
 
   void setSenderManifest(TransferManifest manifest) {
     state = state.copyWith(senderManifest: manifest);
+  }
+
+  void setTransferTallies(
+    Map<DataCategory, int> written,
+    Map<DataCategory, int> skipped,
+  ) {
+    state = state.copyWith(
+      writtenByCategory: Map<DataCategory, int>.from(written),
+      skippedByCategory: Map<DataCategory, int>.from(skipped),
+    );
   }
 }
 

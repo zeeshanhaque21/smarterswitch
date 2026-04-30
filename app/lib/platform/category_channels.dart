@@ -10,17 +10,9 @@ library;
 
 import 'package:flutter/services.dart';
 
-class CallLogReader {
-  CallLogReader({MethodChannel? channel})
-      : _channel = channel ?? const MethodChannel('smarterswitch/calllog');
-  final MethodChannel _channel;
-
-  Future<bool> hasReadPermission() async =>
-      (await _channel.invokeMethod<bool>('hasReadPermission')) ?? false;
-
-  Future<int> count() async =>
-      (await _channel.invokeMethod<num>('count'))?.toInt() ?? 0;
-}
+// CallLogReader lives in `lib/platform/call_log_reader.dart` because it grew a
+// readAll/writeAll surface that doesn't fit the count-only shape of the
+// other wrappers in this file.
 
 class ContactsReader {
   ContactsReader({MethodChannel? channel})
