@@ -134,6 +134,18 @@ sealed class TransferEnvelope {
         );
       case 'transfer_done':
         return const TransferDoneEnvelope();
+      case 'resume':
+        return ResumeEnvelope(
+          watermarks: {
+            for (final entry
+                in (raw['watermarks'] as Map<String, dynamic>? ?? const {})
+                    .entries)
+              DataCategory.values.firstWhere(
+                (c) => c.name == entry.key,
+                orElse: () => DataCategory.sms,
+              ): (entry.value as num).toInt(),
+          },
+        );
       default:
         throw FormatException('Unknown envelope kind: ${raw['kind']}');
     }
@@ -290,6 +302,26 @@ class CalendarEventEnvelope extends TransferEnvelope {
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'calendar_record',
         'record': CalendarEventCodec.toJson(record),
+      })));
+}
+
+/// Receiver → sender, sent at the start of each transfer session.
+/// Carries the highest sequence number the receiver has successfully
+/// written per category from any prior session. Sender skips that many
+/// records before resuming the stream — so a Wi-Fi drop mid-photo-transfer
+/// doesn't restart SMS from zero on reconnect.
+///
+/// First-time transfers send watermarks of 0 (or no entry) per category,
+/// which is identical to "start from the beginning."
+class ResumeEnvelope extends TransferEnvelope {
+  ResumeEnvelope({required this.watermarks});
+  final Map<DataCategory, int> watermarks;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'resume',
+        'watermarks': {
+          for (final e in watermarks.entries) e.key.name: e.value,
+        },
       })));
 }
 

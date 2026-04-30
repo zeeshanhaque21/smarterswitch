@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -16,6 +17,7 @@ import '../core/model/contact.dart';
 import '../core/model/sms_record.dart';
 import '../core/transfer/manifest.dart';
 import '../core/transfer/transport.dart';
+import '../core/transfer/wal.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
 import '../platform/contacts_reader.dart';
@@ -122,41 +124,53 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
+    // Wait briefly for the receiver's ResumeEnvelope so we can skip records
+    // it already wrote in a prior session (Wi-Fi drop / app crash). On
+    // first-ever transfer or v0.11-receiver back-compat, no Resume comes —
+    // we time out and treat all watermarks as 0 (= "start from the top").
+    final skip = await _awaitReceiverResume(session);
+    if (skip.values.any((n) => n > 0) && mounted) {
+      setState(() {});
+    }
+
     for (final category in manifest.categories) {
       _processed[category] = 0;
+      final n = skip[category] ?? 0;
       switch (category) {
         case DataCategory.sms:
           final records = await SmsReader().readAll();
-          for (final r in records) {
-            await session.sendFrame(SmsRecordEnvelope(r).toBytes());
+          for (var i = 0; i < records.length; i++) {
+            if (i < n) continue;
+            await session.sendFrame(SmsRecordEnvelope(records[i]).toBytes());
             _processed[category] = (_processed[category] ?? 0) + 1;
             if (mounted) setState(() {});
           }
           break;
         case DataCategory.callLog:
           final records = await CallLogReader().readAll();
-          for (final r in records) {
-            await session.sendFrame(CallLogRecordEnvelope(r).toBytes());
+          for (var i = 0; i < records.length; i++) {
+            if (i < n) continue;
+            await session.sendFrame(CallLogRecordEnvelope(records[i]).toBytes());
             _processed[category] = (_processed[category] ?? 0) + 1;
             if (mounted) setState(() {});
           }
           break;
         case DataCategory.contacts:
-          final records = await ContactsReader().readAll();
-          for (final r in records) {
-            // Skip Google-synced contacts on the sender side — Google's own
-            // sync handles them across devices, and we don't want to write
-            // duplicates as on-device contacts on the receiver.
-            if (r.isGoogleSynced) continue;
-            await session.sendFrame(ContactRecordEnvelope(r).toBytes());
+          final records = (await ContactsReader().readAll())
+              .where((c) => !c.isGoogleSynced)
+              .toList(growable: false);
+          for (var i = 0; i < records.length; i++) {
+            if (i < n) continue;
+            await session.sendFrame(ContactRecordEnvelope(records[i]).toBytes());
             _processed[category] = (_processed[category] ?? 0) + 1;
             if (mounted) setState(() {});
           }
           break;
         case DataCategory.calendar:
           final records = await CalendarReader().readAll();
-          for (final r in records) {
-            await session.sendFrame(CalendarEventEnvelope(r).toBytes());
+          for (var i = 0; i < records.length; i++) {
+            if (i < n) continue;
+            await session.sendFrame(CalendarEventEnvelope(records[i]).toBytes());
             _processed[category] = (_processed[category] ?? 0) + 1;
             if (mounted) setState(() {});
           }
@@ -171,6 +185,32 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
     }
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
+  }
+
+  /// Briefly subscribe to the session's incoming frames and wait for a
+  /// ResumeEnvelope. If none arrives within 5s, fall back to "skip nothing"
+  /// — the receiver may be a v0.11 build that doesn't send Resume.
+  Future<Map<DataCategory, int>> _awaitReceiverResume(
+    PairedSession session,
+  ) async {
+    final completer = Completer<Map<DataCategory, int>>();
+    final sub = session.incomingFrames().listen((frame) {
+      try {
+        final env = TransferEnvelope.fromBytes(frame);
+        if (env is ResumeEnvelope && !completer.isCompleted) {
+          completer.complete(env.watermarks);
+        }
+      } catch (_) {/* not for us */}
+    });
+    try {
+      final result =
+          await completer.future.timeout(const Duration(seconds: 5));
+      return result;
+    } on TimeoutException {
+      return const {};
+    } finally {
+      await sub.cancel();
+    }
   }
 
   Future<void> _streamPhotos(
@@ -266,6 +306,37 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
+    // Per-category WAL: persists the count of records this device has
+    // received per category across sessions. After a Wi-Fi drop, the
+    // next session reads these watermarks and we ship them to the sender
+    // via ResumeEnvelope so it skips records we already have. Photos use
+    // sha256-based dedup (the existing pre-flight skip-list) instead of
+    // ordinal sequencing — they don't get a WAL.
+    final walDir = (await getApplicationSupportDirectory()).path;
+    final wals = <DataCategory, CategoryWal>{
+      for (final c in manifest.categories
+          .where((c) => c != DataCategory.photos))
+        c: await CategoryWal.open('$walDir/${c.name}.wal'),
+    };
+    final receivedByCategory = <DataCategory, int>{
+      for (final e in wals.entries) e.key: e.value.watermark,
+    };
+
+    // Tell the sender what we already have so it can skip ahead.
+    await session.sendFrame(ResumeEnvelope(
+      watermarks: {
+        for (final e in wals.entries) e.key: e.value.watermark,
+      },
+    ).toBytes());
+
+    Future<void> ackReceived(DataCategory c) async {
+      final next = (receivedByCategory[c] ?? 0) + 1;
+      receivedByCategory[c] = next;
+      try {
+        await wals[c]?.ack(next);
+      } catch (_) {/* WAL ack regression — ignore */}
+    }
+
     // Build per-category dedup indexes from what already exists locally,
     // so incoming records that match get skipped instead of duplicated.
     final callLogIndex = manifest.categories.contains(DataCategory.callLog)
@@ -322,6 +393,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               }
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
+              ackReceived(DataCategory.sms);
               if (mounted) setState(() {});
               break;
             case CallLogRecordEnvelope(:final record):
@@ -333,6 +405,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               }
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
+              ackReceived(DataCategory.callLog);
               if (mounted) setState(() {});
               break;
             case ContactRecordEnvelope(:final record):
@@ -348,6 +421,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               }
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
+              ackReceived(DataCategory.contacts);
               if (mounted) setState(() {});
               break;
             case CalendarEventEnvelope(:final record):
@@ -359,6 +433,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               }
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
+              ackReceived(DataCategory.calendar);
               if (mounted) setState(() {});
               break;
             case PhotoHashesEnvelope(:final hashes):
@@ -481,6 +556,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             case TransferDoneEnvelope():
               if (!completer.isCompleted) completer.complete();
               break;
+            case ResumeEnvelope():
+              // Receiver-side: never receives Resume (it sends, not consumes).
+              // If we land here it's a stray frame — drop it.
+              break;
           }
         } catch (e) {
           if (!completer.isCompleted) completer.completeError(e);
@@ -497,6 +576,16 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     );
 
     await completer.future;
+
+    // Successful transfer — reset all per-category WALs so the next
+    // transfer starts fresh. Mid-transfer drops never reach here, so
+    // the next session reads non-zero watermarks and resumes.
+    for (final wal in wals.values) {
+      try {
+        await wal.reset();
+        await wal.close();
+      } catch (_) {}
+    }
   }
 
   /// Flush the SMS batch via the default-SMS-app role grab dance:
