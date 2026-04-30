@@ -140,6 +140,8 @@ sealed class TransferEnvelope {
         );
       case 'transfer_done':
         return const TransferDoneEnvelope();
+      case 'heartbeat':
+        return const HeartbeatEnvelope();
       case 'resume':
         return ResumeEnvelope(
           watermarks: {
@@ -337,6 +339,18 @@ class CalendarEventEnvelope extends TransferEnvelope {
         'kind': 'calendar_record',
         'record': CalendarEventCodec.toJson(record),
       })));
+}
+
+/// Sender → receiver "I'm still alive" tick. Emitted every few seconds
+/// during long pauses (notably the photo pre-flight hashing pass) so
+/// the receiver's incoming-frames stream sees traffic and the OS / Wi-Fi
+/// power management doesn't tear down an idle TCP socket. Receiver
+/// handles it as a no-op.
+class HeartbeatEnvelope extends TransferEnvelope {
+  const HeartbeatEnvelope();
+  @override
+  Uint8List toBytes() =>
+      Uint8List.fromList(utf8.encode(jsonEncode({'kind': 'heartbeat'})));
 }
 
 /// Receiver → sender, sent at the start of each transfer session.

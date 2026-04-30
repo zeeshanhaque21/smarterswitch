@@ -20,6 +20,14 @@ import 'wire/frame_codec.dart';
 class SecureSocketSession implements PairedSession {
   SecureSocketSession({required this.peerDisplayName, required Socket socket})
       : _socket = socket {
+    // Keep the kernel TCP keepalive on so an idle connection (during
+    // the sender's pre-flight hashing pass, say) doesn't get silently
+    // dropped by Wi-Fi power management or intermediate firewall
+    // timeouts. App-layer heartbeats are still sent during known
+    // long-idle phases as belt-and-suspenders.
+    try {
+      socket.setOption(SocketOption.tcpNoDelay, true);
+    } catch (_) {}
     _subscription = socket.listen(
       _onData,
       onDone: () {

@@ -18,6 +18,7 @@ import '../core/model/contact.dart';
 import '../core/model/media_record.dart';
 import '../core/model/sms_record.dart';
 import '../core/transfer/manifest.dart';
+import '../core/transfer/photo_hash_cache.dart';
 import '../core/transfer/transport.dart';
 import '../core/transfer/wal.dart';
 import '../platform/calendar_reader.dart';
@@ -62,6 +63,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   /// Number of photos sender has hashed pre-flight. Surfaced as the
   /// "Hashing N / total" line during the pre-flight pass.
   int _hashed = 0;
+  int _hashTotal = 0;
 
   /// Number of photos the receiver said to skip via PhotoSkipListEnvelope.
   /// Used in Done-screen reporting and the progress label so the user
@@ -221,30 +223,79 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   ) async {
     final reader = MediaReader();
     final files = await reader.readMetadata();
+    if (mounted) setState(() => _hashTotal = files.length);
+
+    // Open the persistent hash cache. Per-file cache hit = no bytes read
+    // for that file → near-instant pre-flight on subsequent transfers
+    // when the library is unchanged.
+    final cacheDir = (await getApplicationSupportDirectory()).path;
+    final cache = await PhotoHashCache.open(cacheDir);
+
+    // Heartbeat: while we're chewing through the library, the TCP socket
+    // would otherwise sit idle for minutes. Wi-Fi power management on
+    // some OEMs / NAT timeouts on some routers will silently kill an
+    // idle connection. Sending one tick every 5s keeps the kernel and
+    // any hops in the path convinced the connection is alive — and is
+    // what the receiver needs to keep its incoming-frames stream from
+    // firing onDone.
+    final heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
+      session
+          .sendFrame(const HeartbeatEnvelope().toBytes())
+          .catchError((Object _) {});
+    });
 
     // Pre-flight pass: hash every photo before any bytes go out, so we can
     // ask the receiver which it already has. The hash pass is the long
-    // pole on a 30k-photo library (~2 minutes); progress is exposed to
-    // the user via the Hashing column.
+    // pole on a 30k-photo library (~2 minutes on first run, near-instant
+    // on subsequent runs when the cache is warm).
     final hashed = <String, MediaMetadata>{};
     final pHashBySha = <String, int>{};
-    for (final f in files) {
-      try {
-        final sha = await reader.readSha256(f.uri);
-        if (!hashed.containsKey(sha)) {
-          hashed[sha] = f;
-          // pHash is best-effort: videos return null, RAW formats return
-          // null. Receiver-side fuzzy match treats null pHash as "skip".
-          if (f.kind == MediaKind.image) {
-            final ph = await reader.computePHash(f.uri);
+    final liveUris = <String>{};
+    try {
+      for (final f in files) {
+        liveUris.add(f.uri);
+        try {
+          // Cache lookup: hit iff URI known AND (byteSize, modifiedAtMs)
+          // match. Cache miss → compute via the platform channels.
+          final cached = cache.get(
+            f.uri,
+            byteSize: f.byteSize,
+            modifiedAtMs: f.modifiedAtMs,
+          );
+          final String sha;
+          int? ph;
+          if (cached != null) {
+            sha = cached.sha256;
+            ph = cached.pHash;
+          } else {
+            sha = await reader.readSha256(f.uri);
+            if (f.kind == MediaKind.image) {
+              ph = await reader.computePHash(f.uri);
+            }
+            cache.put(
+              f.uri,
+              byteSize: f.byteSize,
+              modifiedAtMs: f.modifiedAtMs,
+              sha256: sha,
+              pHash: ph,
+            );
+          }
+          if (!hashed.containsKey(sha)) {
+            hashed[sha] = f;
             if (ph != null) pHashBySha[sha] = ph;
           }
+          _hashed += 1;
+          if (mounted) setState(() {});
+        } catch (_) {
+          // File became unreadable (deleted, permission revoked) — skip.
         }
-        _hashed += 1;
-        if (mounted) setState(() {});
-      } catch (_) {
-        // File became unreadable (deleted, permission revoked) — skip.
       }
+      // Drop cache entries for files no longer on the device. Keeps the
+      // cache file from growing unboundedly across years of use.
+      cache.retainOnly(liveUris);
+      await cache.save();
+    } finally {
+      heartbeat.cancel();
     }
 
     // Send the hashes; await the receiver's skip list.
@@ -605,6 +656,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               // Receiver-side: never receives Resume (it sends, not consumes).
               // If we land here it's a stray frame — drop it.
               break;
+            case HeartbeatEnvelope():
+              // Sender's keepalive tick during the photo pre-flight pass.
+              // No-op — we only need it to keep the TCP socket warm and
+              // signal "still working, hold on."
+              break;
           }
         } catch (e) {
           if (!completer.isCompleted) completer.completeError(e);
@@ -739,6 +795,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (_isHashingPhase(state)) _hashingBanner(),
             const SizedBox(height: 8),
             for (final c in manifest.categories) _categoryRow(manifest, c),
             const Spacer(),
@@ -749,6 +806,48 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                 child: Text('Working…',
                     style: TextStyle(fontStyle: FontStyle.italic)),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// True when the sender is in the photo pre-flight hashing pass and
+  /// hasn't started streaming chunks yet. Drives the prominent
+  /// hashing-progress banner.
+  bool _isHashingPhase(TransferState state) {
+    if (state.role != DeviceRole.sender) return false;
+    if (_hashTotal == 0) return false;
+    return _hashed < _hashTotal;
+  }
+
+  Widget _hashingBanner() {
+    final theme = Theme.of(context);
+    final pct = _hashTotal == 0 ? 0.0 : _hashed / _hashTotal;
+    return Card(
+      color: theme.colorScheme.primaryContainer,
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Preparing photos',
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.onPrimaryContainer,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Hashing $_hashed / $_hashTotal — first run only; future '
+              'transfers reuse this work.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onPrimaryContainer,
+              ),
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: pct.clamp(0.0, 1.0)),
           ],
         ),
       ),

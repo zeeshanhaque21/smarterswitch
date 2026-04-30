@@ -361,6 +361,7 @@ object MediaChannel {
             MediaStore.Files.FileColumns.MIME_TYPE,
             MediaStore.Files.FileColumns.MEDIA_TYPE,
             MediaStore.Files.FileColumns.DATE_TAKEN,
+            MediaStore.Files.FileColumns.DATE_MODIFIED,
         )
         context.contentResolver.query(uri, projection, selection, args, null)?.use { cursor ->
             val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
@@ -372,6 +373,8 @@ object MediaChannel {
                 cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE)
             val takenIdx =
                 cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_TAKEN)
+            val modifiedIdx =
+                cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idIdx)
                 val isVideo = cursor.getInt(typeIdx) ==
@@ -390,6 +393,10 @@ object MediaChannel {
                         "mimeType" to (cursor.getString(mimeIdx) ?: "application/octet-stream"),
                         "kind" to if (isVideo) "video" else "image",
                         "takenAtMs" to (if (cursor.isNull(takenIdx)) null else cursor.getLong(takenIdx)),
+                        // DATE_MODIFIED is in seconds in MediaStore;
+                        // multiply for ms-since-epoch consistency.
+                        "modifiedAtMs" to (if (cursor.isNull(modifiedIdx)) 0L
+                            else cursor.getLong(modifiedIdx) * 1000L),
                     )
                 )
             }

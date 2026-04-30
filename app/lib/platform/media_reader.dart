@@ -47,6 +47,7 @@ class MediaReader {
               kind:
                   (m['kind'] as String?) == 'video' ? MediaKind.video : MediaKind.image,
               takenAtMs: (m['takenAtMs'] as num?)?.toInt(),
+              modifiedAtMs: (m['modifiedAtMs'] as num?)?.toInt() ?? 0,
             ))
         .toList(growable: false);
   }
@@ -127,6 +128,7 @@ class MediaMetadata {
     required this.mimeType,
     required this.kind,
     this.takenAtMs,
+    this.modifiedAtMs = 0,
   });
 
   final String uri;
@@ -135,6 +137,10 @@ class MediaMetadata {
   final String mimeType;
   final MediaKind kind;
   final int? takenAtMs;
+
+  /// MediaStore.DATE_MODIFIED in ms. Used as the cache-invalidation key
+  /// alongside byteSize — if either changes, recompute hashes.
+  final int modifiedAtMs;
 }
 
 class MediaSummary {
