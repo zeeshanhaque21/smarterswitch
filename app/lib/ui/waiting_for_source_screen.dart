@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -45,6 +46,17 @@ class _WaitingForSourceScreenState
     }
     _sub = session.incomingFrames().listen(
       (frame) {
+        // The session-level heartbeat ticks every 5s under the same AES-GCM
+        // seal as the manifest, so heartbeat frames can arrive before the
+        // sender finishes picking categories. Skip them — only the manifest
+        // frame should advance us off this screen.
+        try {
+          final raw =
+              jsonDecode(utf8.decode(frame)) as Map<String, dynamic>;
+          if (raw['kind'] == 'heartbeat') return;
+        } catch (_) {
+          // Fall through to fromBytes which will surface a useful error.
+        }
         try {
           final manifest = TransferManifest.fromBytes(frame);
           ref
