@@ -261,8 +261,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       } catch (_) {/* not for us */}
     });
     try {
+      // 15s window: the receiver may still be running readAll() across
+      // its existing local SMS/CallLog before it can answer with the
+      // Resume envelope. 5s wasn't enough on a phone with thousands of
+      // existing records.
       final result =
-          await completer.future.timeout(const Duration(seconds: 5));
+          await completer.future.timeout(const Duration(seconds: 15));
       return result;
     } on TimeoutException {
       return const {};
@@ -452,13 +456,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       for (final e in wals.entries) e.key: e.value.watermark,
     };
 
-    // Tell the sender what we already have so it can skip ahead.
-    await session.sendFrame(ResumeEnvelope(
-      watermarks: {
-        for (final e in wals.entries) e.key: e.value.watermark,
-      },
-    ).toBytes());
-
     Future<void> ackReceived(DataCategory c) async {
       final next = (receivedByCategory[c] ?? 0) + 1;
       receivedByCategory[c] = next;
@@ -469,6 +466,15 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
     // Build per-category dedup indexes from what already exists locally,
     // so incoming records that match get skipped instead of duplicated.
+    //
+    // Crucial ordering: this must finish BEFORE we send ResumeEnvelope.
+    // SecureSocketSession.incomingFrames() is backed by a broadcast
+    // stream that drops events for time windows where no listener is
+    // attached. Earlier versions sent Resume first and built the
+    // indexes second; the sender immediately started streaming records
+    // while the receiver was still readAll()-ing local data, and those
+    // first-batch frames vanished — the receiver then hung waiting for
+    // CategoryDone / TransferDone that never arrived after.
     final callLogIndex = manifest.categories.contains(DataCategory.callLog)
         ? CallLogDedup.indexOf(await CallLogReader().readAll())
         : <CallLogDedupKey>{};
@@ -742,6 +748,19 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         }
       },
     );
+
+    // Now that the listener is attached, tell the sender what we
+    // already have so it can skip ahead. Sending Resume earlier (or
+    // never sending it) was the source of the silent-hang regression
+    // — the broadcast stream behind incomingFrames() drops events
+    // arriving before any listener is attached.
+    try {
+      await session.sendFrame(ResumeEnvelope(
+        watermarks: {
+          for (final e in wals.entries) e.key: e.value.watermark,
+        },
+      ).toBytes());
+    } catch (_) {/* sender will time out and start fresh */}
 
     await completer.future;
 
