@@ -24,6 +24,7 @@ import '../core/transfer/transport.dart';
 import '../core/transfer/wal.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
+import '../platform/category_counts.dart';
 import '../platform/contacts_reader.dart';
 import '../platform/foreground_service.dart';
 import '../platform/media_reader.dart';
@@ -419,6 +420,22 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
+    // The receiver never went through SelectScreen, so the per-category
+    // read permissions it needs to build dedup indexes (READ_CALL_LOG /
+    // READ_SMS / etc.) are not yet granted. Request them up-front for
+    // exactly the manifest's categories. Any one of them being denied
+    // surfaces as a PlatformException("PERMISSION_DENIED ...") deep
+    // inside the dedup pass — request first so the user sees the
+    // standard system prompt instead of a crash dialog.
+    final neededPermissions = <Permission>{
+      for (final c in manifest.categories) ...permissionsFor(c),
+    };
+    for (final p in neededPermissions) {
+      try {
+        await p.request();
+      } catch (_) {/* best-effort; readAll will surface a real error */}
+    }
+
     // Per-category WAL: persists the count of records this device has
     // received per category across sessions. After a Wi-Fi drop, the
     // next session reads these watermarks and we ship them to the sender
