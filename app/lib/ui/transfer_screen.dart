@@ -245,9 +245,21 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
   }
 
-  /// Briefly subscribe to the session's incoming frames and wait for a
-  /// ResumeEnvelope. If none arrives within 5s, fall back to "skip nothing"
-  /// — the receiver may be a v0.11 build that doesn't send Resume.
+  /// Subscribe to the session's incoming frames and wait for a
+  /// ResumeEnvelope from the receiver. The Resume envelope doubles as the
+  /// receiver's "I'm ready, start streaming" handshake — it's only sent
+  /// once the receiver has built its dedup indexes and attached its
+  /// frame listener (see _runAsReceiver). Without this gate the sender
+  /// would stream records into the void during the receiver's
+  /// Scan-screen tap → permission prompts → readAll() window, and
+  /// SecureSocketSession's broadcast stream would silently drop them.
+  ///
+  /// 120s timeout: long enough for the user to walk through the Scan
+  /// screen on the NEW phone, grant permissions, and let the receiver
+  /// build its dedup indexes. If we time out, raise instead of
+  /// streaming blind — falling back to skip={} caused the v0.16.4
+  /// "receiver hangs after data sent" regression because by then the
+  /// receiver was past its first records-arrival window.
   Future<Map<DataCategory, int>> _awaitReceiverResume(
     PairedSession session,
   ) async {
@@ -261,15 +273,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       } catch (_) {/* not for us */}
     });
     try {
-      // 15s window: the receiver may still be running readAll() across
-      // its existing local SMS/CallLog before it can answer with the
-      // Resume envelope. 5s wasn't enough on a phone with thousands of
-      // existing records.
-      final result =
-          await completer.future.timeout(const Duration(seconds: 15));
-      return result;
+      return await completer.future.timeout(const Duration(seconds: 120));
     } on TimeoutException {
-      return const {};
+      throw StateError(
+        'The other phone never confirmed it was ready to receive. '
+        'Make sure it has tapped "Accept and start transfer" on the '
+        'Review screen, then try again.',
+      );
     } finally {
       await sub.cancel();
     }
