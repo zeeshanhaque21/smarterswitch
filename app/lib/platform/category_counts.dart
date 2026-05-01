@@ -46,24 +46,34 @@ class CategoryProbe {
 
   /// Streaming variant — emits each [CategoryStatus] as soon as that
   /// category's probe completes, so the UI can fill in fast results
-  /// (sms/call-log/contacts/calendar all sub-second) immediately and
-  /// only the slow photos summary keeps a spinner. The Select screen's
-  /// `probeAllCategoryCounts` uses this to avoid the "all five spinners
-  /// stay until the slowest finishes" Future.wait UX.
+  /// immediately. Only categories in [kEnabledCategories] are probed;
+  /// disabled ones never run their permission/count platform calls,
+  /// which sidesteps the slow MediaStore summary, the photos
+  /// permission flow, and any other still-flaky probe paths.
   Stream<CategoryStatus> probeStream() async* {
     final controller = StreamController<CategoryStatus>();
-    var pending = 5;
+    final probes = <Future<CategoryStatus>>[
+      if (kEnabledCategories.contains(DataCategory.sms)) _probeSms(),
+      if (kEnabledCategories.contains(DataCategory.callLog)) _probeCallLog(),
+      if (kEnabledCategories.contains(DataCategory.contacts)) _probeContacts(),
+      if (kEnabledCategories.contains(DataCategory.calendar)) _probeCalendar(),
+      if (kEnabledCategories.contains(DataCategory.photos)) _probeMedia(),
+    ];
+    if (probes.isEmpty) {
+      // Defensive: if every category is disabled (a config bug), close
+      // the stream immediately rather than hanging forever.
+      controller.close();
+      yield* controller.stream;
+      return;
+    }
+    var pending = probes.length;
     void onResult(CategoryStatus s) {
       controller.add(s);
       if (--pending == 0) controller.close();
     }
-
-    _probeSms().then(onResult);
-    _probeCallLog().then(onResult);
-    _probeContacts().then(onResult);
-    _probeCalendar().then(onResult);
-    _probeMedia().then(onResult);
-
+    for (final p in probes) {
+      p.then(onResult);
+    }
     yield* controller.stream;
   }
 

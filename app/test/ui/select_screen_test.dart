@@ -85,16 +85,22 @@ void main() {
       expect(find.text('Photos & videos'), findsOneWidget);
       expect(find.text('Calendar'), findsOneWidget);
 
-      // Counts: 5234 → "5.2K", 412 → "412", 12345 → "12K"
+      // Counts for enabled categories (v0.16): only sms + callLog show
+      // their numbers. Disabled categories render a "Coming soon" chip
+      // instead of the count. 5234 → "5.2K", 412 → "412".
       expect(find.text('5.2K'), findsOneWidget);
       expect(find.text('412'), findsOneWidget);
-      expect(find.text('12K'), findsOneWidget);
 
-      // Photo size estimate
-      expect(find.textContaining('4.19 GB'), findsOneWidget);
+      // Disabled categories carry the chip + subtitle.
+      expect(find.text('Coming soon'), findsNWidgets(3));
+      expect(
+        find.text('Coming back in a future update'),
+        findsNWidgets(3),
+      );
     });
 
-    testWidgets('all five default to selected; bottom CTA reflects total',
+    testWidgets(
+        'enabled categories default to selected; bottom CTA reflects total',
         (tester) async {
       await _pumpWithState(
         tester,
@@ -110,6 +116,8 @@ void main() {
               permissionState: PermissionState.granted,
               count: 50,
             ),
+            // Disabled categories' status entries are ignored by the
+            // CTA total since they're filtered out of the sum.
             DataCategory.contacts: CategoryStatus(
               category: DataCategory.contacts,
               permissionState: PermissionState.granted,
@@ -129,8 +137,11 @@ void main() {
         ),
       );
 
-      // Total: 100+50+25+10+5 = 190
-      expect(find.text('Continue with 5 categories (190 items)'), findsOneWidget);
+      // v0.16: only sms (100) + callLog (50) count toward the total.
+      expect(
+        find.text('Continue with 2 categories (150 items)'),
+        findsOneWidget,
+      );
     });
 
     testWidgets('permission-denied row shows Tap to allow', (tester) async {

@@ -23,6 +23,17 @@ const kCategoryDisplayOrder = <DataCategory>[
   DataCategory.calendar,
 ];
 
+/// Categories the v0.16+ build lets the user actually pick. The other
+/// entries in [DataCategory] remain in the enum, and their readers,
+/// writers, dedup matchers, and Kotlin channels stay in tree — they're
+/// just disabled in the UI and skipped by the probe until the
+/// SMS+Call-log path is validated end-to-end on real hardware. To
+/// re-enable, add the relevant `DataCategory` value here.
+const kEnabledCategories = <DataCategory>{
+  DataCategory.sms,
+  DataCategory.callLog,
+};
+
 enum PermissionState { notRequested, granted, denied, restricted }
 
 @immutable
@@ -62,13 +73,7 @@ class TransferState {
   const TransferState({
     this.role = DeviceRole.unset,
     this.peerName,
-    this.selectedCategories = const {
-      DataCategory.sms,
-      DataCategory.callLog,
-      DataCategory.contacts,
-      DataCategory.photos,
-      DataCategory.calendar,
-    },
+    this.selectedCategories = kEnabledCategories,
     this.scanResult,
     this.categoryStatuses = const {},
     this.conflicts = const [],
@@ -197,7 +202,7 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
   void setAllCategories(bool selected) {
     state = state.copyWith(
       selectedCategories: selected
-          ? Set<DataCategory>.from(kCategoryDisplayOrder)
+          ? Set<DataCategory>.from(kEnabledCategories)
           : <DataCategory>{},
     );
   }

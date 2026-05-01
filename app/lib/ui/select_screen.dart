@@ -78,7 +78,7 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
     final state = ref.watch(transferStateProvider);
     final notifier = ref.read(transferStateProvider.notifier);
 
-    final allOn = state.selectedCategories.length == kCategoryDisplayOrder.length;
+    final allOn = state.selectedCategories.length == kEnabledCategories.length;
     final selectedCount = _selectedItemTotal(state);
     final canContinue = state.selectedCategories.isNotEmpty;
 
@@ -99,6 +99,7 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
               status: state.categoryStatuses[category],
               selected: state.selectedCategories.contains(category),
               probing: _probing,
+              enabled: kEnabledCategories.contains(category),
               onToggle: () => notifier.toggleCategory(category),
               onRequestPermission: () => _requestPermissionFor(category),
             ),
@@ -160,6 +161,10 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
   int _selectedItemTotal(TransferState state) {
     var total = 0;
     for (final c in state.selectedCategories) {
+      // Disabled categories are never selectable, but defend in case a
+      // future change re-introduces them in selectedCategories without
+      // their probe running.
+      if (!kEnabledCategories.contains(c)) continue;
       total += state.categoryStatuses[c]?.count ?? 0;
     }
     return total;
@@ -172,6 +177,7 @@ class _CategoryRow extends StatelessWidget {
     required this.status,
     required this.selected,
     required this.probing,
+    required this.enabled,
     required this.onToggle,
     required this.onRequestPermission,
   });
@@ -180,6 +186,13 @@ class _CategoryRow extends StatelessWidget {
   final CategoryStatus? status;
   final bool selected;
   final bool probing;
+
+  /// `false` for categories outside [kEnabledCategories]. Renders a
+  /// grayed-out, untoggleable row with a "Coming soon" chip — same
+  /// visual idiom we used in v0.0.1 when only SMS was wired. Code
+  /// behind these categories stays in tree; flipping the constant
+  /// brings them back without any other change.
+  final bool enabled;
   final VoidCallback onToggle;
   final VoidCallback onRequestPermission;
 
@@ -190,8 +203,9 @@ class _CategoryRow extends StatelessWidget {
         status?.permissionState == PermissionState.denied;
 
     return CheckboxListTile(
-      value: selected,
-      onChanged: (_) => onToggle(),
+      value: enabled && selected,
+      // Null onChanged renders the checkbox in its disabled state.
+      onChanged: enabled ? (_) => onToggle() : null,
       title: Row(
         children: [
           Icon(meta.icon),
@@ -205,6 +219,12 @@ class _CategoryRow extends StatelessWidget {
   }
 
   Widget _trailing(BuildContext context) {
+    if (!enabled) {
+      return const Chip(
+        label: Text('Coming soon', style: TextStyle(fontSize: 11)),
+        visualDensity: VisualDensity.compact,
+      );
+    }
     if (probing && status == null) {
       return const SizedBox(
         width: 16,
@@ -233,6 +253,9 @@ class _CategoryRow extends StatelessWidget {
   }
 
   Widget? _subtitle(BuildContext context, bool permissionDenied) {
+    if (!enabled) {
+      return const Text('Coming back in a future update');
+    }
     final s = status;
     if (permissionDenied) {
       return const Text('Permission needed for this device');
