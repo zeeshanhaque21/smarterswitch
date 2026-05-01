@@ -9,6 +9,18 @@ import 'handshake.dart';
 import 'transport.dart';
 import 'wire/frame_codec.dart';
 
+/// Thrown by [SecureSocketSession.handshakeAsConnector] /
+/// [handshakeAsAcceptor] when the peer doesn't deliver an expected
+/// handshake line within [SecureSocketSession.handshakeLineTimeout].
+/// Distinct from [PinMismatchException] so the UI can offer "force-stop
+/// and retry" guidance instead of "PIN didn't match."
+class HandshakeTimeoutException implements Exception {
+  const HandshakeTimeoutException();
+  @override
+  String toString() =>
+      'HandshakeTimeoutException: peer went silent during the handshake';
+}
+
 /// Bidirectional `PairedSession` backed by a TCP `Socket`. Owns the *only*
 /// listener on the socket. Performs the SmarterSwitch handshake (PIN line +
 /// X25519 public-key exchange) and then transparently AES-GCM-seals every
@@ -39,10 +51,17 @@ class SecureSocketSession implements PairedSession {
     );
   }
 
+  /// Per-handshake-line timeout. If the peer doesn't deliver the expected
+  /// line within this window — which would otherwise hang the connector
+  /// forever on "Connecting to X..." — throw [HandshakeTimeoutException]
+  /// so the UI can surface a recoverable error.
+  static const Duration handshakeLineTimeout = Duration(seconds: 15);
+
   /// Sender-side handshake. Sends `PIN xxxxxx`, awaits `OK`, performs the
   /// X25519 + HKDF key exchange. Returns a fully-handshaken session ready
   /// for sealed frame traffic. Throws [PinMismatchException] if the
-  /// receiver replies anything other than `OK`.
+  /// receiver replies anything other than `OK`, or [HandshakeTimeoutException]
+  /// if the receiver goes silent at any handshake step.
   static Future<SecureSocketSession> handshakeAsConnector({
     required Socket socket,
     required String peerDisplayName,
@@ -52,16 +71,23 @@ class SecureSocketSession implements PairedSession {
       peerDisplayName: peerDisplayName,
       socket: socket,
     );
-    socket.write('PIN $pin\n');
-    await socket.flush();
-    final reply = (await session._readHandshakeLine()).trim();
-    if (reply == 'OK') {
-      await session._performKeyExchange(pin);
-      session._handshakeDone();
-      return session;
+    try {
+      socket.write('PIN $pin\n');
+      await socket.flush();
+      final reply = (await session._readHandshakeLine()
+              .timeout(handshakeLineTimeout))
+          .trim();
+      if (reply == 'OK') {
+        await session._performKeyExchange(pin);
+        session._handshakeDone();
+        return session;
+      }
+      await session.close();
+      throw const PinMismatchException();
+    } on TimeoutException {
+      await session.close();
+      throw const HandshakeTimeoutException();
     }
-    await session.close();
-    throw const PinMismatchException();
   }
 
   /// Receiver-side handshake. Reads `PIN xxxxxx` from the wire, replies
@@ -77,19 +103,26 @@ class SecureSocketSession implements PairedSession {
       peerDisplayName: peerDisplayName,
       socket: socket,
     );
-    final received = (await session._readHandshakeLine()).trim();
-    if (received.startsWith('PIN ') &&
-        received.substring(4) == expectedPin) {
-      socket.write('OK\n');
+    try {
+      final received = (await session._readHandshakeLine()
+              .timeout(handshakeLineTimeout))
+          .trim();
+      if (received.startsWith('PIN ') &&
+          received.substring(4) == expectedPin) {
+        socket.write('OK\n');
+        await socket.flush();
+        await session._performKeyExchange(expectedPin);
+        session._handshakeDone();
+        return session;
+      }
+      socket.write('BAD\n');
       await socket.flush();
-      await session._performKeyExchange(expectedPin);
-      session._handshakeDone();
-      return session;
+      await session.close();
+      throw const PinMismatchException();
+    } on TimeoutException {
+      await session.close();
+      throw const HandshakeTimeoutException();
     }
-    socket.write('BAD\n');
-    await socket.flush();
-    await session.close();
-    throw const PinMismatchException();
   }
 
   @override
@@ -117,7 +150,8 @@ class SecureSocketSession implements PairedSession {
     final keyPair = await Handshake.generate();
     _socket.write('PUBKEY ${base64.encode(keyPair.publicKeyBytes)}\n');
     await _socket.flush();
-    final line = (await _readHandshakeLine()).trim();
+    final line =
+        (await _readHandshakeLine().timeout(handshakeLineTimeout)).trim();
     if (!line.startsWith('PUBKEY ')) {
       throw StateError('Expected PUBKEY, got "$line"');
     }

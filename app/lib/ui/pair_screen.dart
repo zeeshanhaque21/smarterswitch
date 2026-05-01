@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../core/transfer/lan_transport.dart';
+import '../core/transfer/secure_socket_session.dart';
 import '../core/transfer/transport.dart';
 import '../core/transfer/wifi_direct_transport.dart';
 import '../state/transfer_state.dart';
@@ -223,6 +224,17 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       setState(() {
         _phase = _PairPhase.senderEnterPin;
         _errorMessage = 'PIN didn\'t match. Try again.';
+      });
+    } on HandshakeTimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _phase = _PairPhase.error;
+        _errorMessage =
+            'The other phone went silent during the handshake.\n\n'
+            'Force-stop SmarterSwitch on both phones (Settings → Apps → '
+            'SmarterSwitch → Force Stop) and try again. If you used '
+            'Wi-Fi Direct, also disconnect any peers in Settings → '
+            'Wi-Fi → Wi-Fi Direct.';
       });
     } catch (e) {
       if (!mounted) return;
