@@ -140,7 +140,13 @@ class CategoryProbe {
     required Future<bool> Function() hasPermission,
     required Future<int> Function() count,
   }) async {
-    final granted = await _safeBool(hasPermission);
+    // 5-second timeout on each step. A platform channel that never
+    // returns (rare but real on some OEMs) used to leave the row's
+    // spinner spinning forever; v0.15.1 forces a worst-case 10s before
+    // every category surfaces SOMETHING (count, denied, or the
+    // unknown-state fallback).
+    final granted =
+        await _safeBool(hasPermission, timeout: const Duration(seconds: 5));
     if (!granted) {
       return CategoryStatus(
         category: category,
@@ -148,7 +154,7 @@ class CategoryProbe {
       );
     }
     try {
-      final n = await count();
+      final n = await count().timeout(const Duration(seconds: 5));
       return CategoryStatus(
         category: category,
         permissionState: PermissionState.granted,
@@ -162,9 +168,13 @@ class CategoryProbe {
     }
   }
 
-  Future<bool> _safeBool(Future<bool> Function() f) async {
+  Future<bool> _safeBool(
+    Future<bool> Function() f, {
+    Duration? timeout,
+  }) async {
     try {
-      return await f();
+      final fut = f();
+      return await (timeout == null ? fut : fut.timeout(timeout));
     } catch (_) {
       return false;
     }

@@ -170,23 +170,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     }
     if (mounted) setState(() {});
 
-    // Global heartbeat for the whole sender lifetime. Without this, any
-    // preparation phase (readAll() for a long contacts list, SMS dump on
-    // a 50k-message device, photo hashing pass) blocks the main isolate
-    // long enough for Wi-Fi power management or NAT timeouts to silently
-    // drop the idle TCP socket. The receiver's incoming-frames stream
-    // then fires onDone → "the other phone disconnected." Heartbeats keep
-    // every hop convinced the connection is alive.
-    final senderHeartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
-      session
-          .sendFrame(const HeartbeatEnvelope().toBytes())
-          .catchError((Object _) {});
-    });
-    try {
-      await _runSenderInner(session, manifest, skip);
-    } finally {
-      senderHeartbeat.cancel();
-    }
+    // Heartbeat is now session-level (SecureSocketSession runs a 5s
+    // ticker for the full socket lifetime). No transfer-specific timer
+    // needed here.
+    await _runSenderInner(session, manifest, skip);
   }
 
   Future<void> _runSenderInner(

@@ -32,11 +32,6 @@ class HandshakeTimeoutException implements Exception {
 class SecureSocketSession implements PairedSession {
   SecureSocketSession({required this.peerDisplayName, required Socket socket})
       : _socket = socket {
-    // Keep the kernel TCP keepalive on so an idle connection (during
-    // the sender's pre-flight hashing pass, say) doesn't get silently
-    // dropped by Wi-Fi power management or intermediate firewall
-    // timeouts. App-layer heartbeats are still sent during known
-    // long-idle phases as belt-and-suspenders.
     try {
       socket.setOption(SocketOption.tcpNoDelay, true);
     } catch (_) {}
@@ -50,6 +45,26 @@ class SecureSocketSession implements PairedSession {
       },
     );
   }
+
+  /// Starts the session-level heartbeat ticker. Called from
+  /// _handshakeDone — before that, only handshake text lines flow and
+  /// HeartbeatEnvelope (a framed JSON envelope) would confuse the
+  /// line-reader. Timer fires every 5s, sends a HeartbeatEnvelope-shaped
+  /// JSON frame (under AES-GCM seal). Receiver-side any-screen frame
+  /// listener ignores it but the very fact bytes flow keeps Wi-Fi power
+  /// management / NAT timeouts from dropping the idle socket. Cancelled
+  /// in close().
+  void _startHeartbeat() {
+    _heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
+      // The HeartbeatEnvelope JSON: `{"kind":"heartbeat"}`. Hardcoded
+      // here to avoid an import cycle with the manifest module —
+      // SecureSocketSession is meant to be wire-only.
+      sendFrame(Uint8List.fromList(utf8.encode('{"kind":"heartbeat"}')))
+          .catchError((Object _) {});
+    });
+  }
+
+  Timer? _heartbeat;
 
   /// Per-handshake-line timeout. If the peer doesn't deliver the expected
   /// line within this window — which would otherwise hang the connector
@@ -194,6 +209,11 @@ class SecureSocketSession implements PairedSession {
       _incoming.add(_handshakeBuffer.toBytes());
       _handshakeBuffer.clear();
     }
+    // Now that the session is sealed and ready, start the keepalive
+    // ticker. Runs for the entire session lifetime so the socket stays
+    // warm across screen transitions (Select → Scan → Transfer can be
+    // minutes of idle while the user is reading the UI).
+    _startHeartbeat();
   }
 
   void _onData(Uint8List data) {
@@ -248,6 +268,8 @@ class SecureSocketSession implements PairedSession {
 
   @override
   Future<void> close() async {
+    _heartbeat?.cancel();
+    _heartbeat = null;
     await _subscription.cancel();
     try {
       await _socket.close();

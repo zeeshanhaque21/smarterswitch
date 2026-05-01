@@ -40,11 +40,24 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
     final alreadyHaveData =
         ref.read(transferStateProvider).categoryStatuses.isNotEmpty;
     if (!alreadyHaveData) {
+      // Fire-and-forget the permission requests. Awaiting Future.wait
+      // here used to block the whole flow if even one permission's
+      // request() Future never resolved (permission_handler has had
+      // edge cases on certain OEMs around permanentlyDenied returning
+      // a never-completing Future). Probes run regardless: any
+      // not-yet-granted category surfaces as "Tap to allow" via the
+      // existing per-row inline CTA, and a single tap re-prompts that
+      // one permission and re-probes.
       final allPermissions = <Permission>{
         for (final c in kCategoryDisplayOrder) ...permissionsFor(c),
       };
-      await Future.wait(allPermissions.map((p) => p.request()));
-      if (!mounted) return;
+      for (final p in allPermissions) {
+        // ignore: discarded_futures
+        p.request().catchError((Object _) {
+          // Best-effort; failures are reflected in the per-row state.
+          return PermissionStatus.denied;
+        });
+      }
     }
     await ref.read(transferStateProvider.notifier).probeAllCategoryCounts();
     if (mounted) setState(() => _probing = false);
