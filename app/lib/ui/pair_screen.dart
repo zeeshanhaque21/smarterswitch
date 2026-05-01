@@ -101,6 +101,20 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // If the user just hit "Start over" from a downstream screen, a
+      // PairedSession (with its heartbeat timer + bound socket) and any
+      // backing transport advert may still be alive. Without tearing
+      // them down here, the next pair attempt's advertise / accept
+      // can fail with EADDRINUSE or surface a duplicate mDNS name,
+      // which presents as the OLD phone's "Looking for the new
+      // phone…" hanging.
+      final prior = ref.read(transferStateProvider).pairedSession;
+      if (prior != null) {
+        try {
+          await prior.close();
+        } catch (_) {}
+        ref.read(transferStateProvider.notifier).clearPairedSession();
+      }
       final available = await WifiDirectTransport.isAvailable();
       if (!mounted) return;
       setState(() {
@@ -307,13 +321,20 @@ class _PairScreenState extends ConsumerState<PairScreen> {
 
   /// Sender-side: enter the manual-pairing form. No discovery, no
   /// Wi-Fi Direct probing — straight to a TCP connect on a host:port
-  /// the user types in.
+  /// the user types in. Tears down any in-flight discovery so its
+  /// socket / Wi-Fi Direct group doesn't sit around competing with
+  /// the manual connect.
   void _enterManualMode() {
+    _peerSub?.cancel();
+    _peerSub = null;
+    _transport?.close();
+    _transport = null;
     setState(() {
       _phase = _PairPhase.senderManualEntry;
       _manualHost = '';
       _manualPort = '';
       _pinInput = '';
+      _peers.clear();
       _errorMessage = null;
     });
   }
@@ -728,6 +749,18 @@ class _PairScreenState extends ConsumerState<PairScreen> {
                       );
                     },
                   ),
+          ),
+          // Escape hatch: discovery can stall behind stale Wi-Fi Direct
+          // groups, mDNS caches that haven't refreshed, or the receiver
+          // running on a different subnet. Surface manual entry up-front
+          // so the user doesn't have to back out and start over.
+          const Divider(),
+          TextButton.icon(
+            onPressed: _enterManualMode,
+            icon: const Icon(Icons.keyboard),
+            label: const Text(
+              "Can't find the other phone? Enter IP & port manually",
+            ),
           ),
         ],
       ),
