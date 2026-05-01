@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
@@ -41,6 +42,26 @@ import '../state/transfer_state.dart';
 ///
 /// v0.4 covers the call-log path end-to-end. The other categories'
 /// readers/writers land in v0.5+ but plug into the same envelope flow.
+/// Per-category lifecycle on the sender. Each row in the Transfer screen
+/// renders its status from this. Receiver-side a simpler "active vs done"
+/// distinction is drawn from `_processed[c]` against `manifest.counts[c]`.
+enum _CategoryPhase {
+  /// Not yet reached in the sender's iteration order.
+  queued,
+
+  /// Reading metadata / hashing — for photos this is the long pre-flight
+  /// hash pass; for other categories it's the brief platform-channel
+  /// readAll() call.
+  preparing,
+
+  /// Streaming records over the wire.
+  streaming,
+
+  /// All records of this category have been sent (sender) or written
+  /// (receiver).
+  done,
+}
+
 class TransferScreen extends ConsumerStatefulWidget {
   const TransferScreen({super.key});
 
@@ -55,6 +76,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   final Map<DataCategory, int> _processed = {};
   final Map<DataCategory, int> _writtenByCategory = {};
   final Map<DataCategory, int> _skippedByCategory = {};
+
+  /// Per-category lifecycle state — what phase each row is in. Drives the
+  /// status label and color in the per-row UI so the user can see at a
+  /// glance which category is being prepared/streamed/done.
+  final Map<DataCategory, _CategoryPhase> _phase = {};
   bool _done = false;
   String? _error;
   StreamSubscription? _incomingSub;
@@ -137,47 +163,85 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       setState(() {});
     }
 
+    // Initialize all categories to queued so the rows render the right
+    // state from the start instead of looking idle.
+    for (final c in manifest.categories) {
+      _phase[c] = _CategoryPhase.queued;
+    }
+    if (mounted) setState(() {});
+
+    // Global heartbeat for the whole sender lifetime. Without this, any
+    // preparation phase (readAll() for a long contacts list, SMS dump on
+    // a 50k-message device, photo hashing pass) blocks the main isolate
+    // long enough for Wi-Fi power management or NAT timeouts to silently
+    // drop the idle TCP socket. The receiver's incoming-frames stream
+    // then fires onDone → "the other phone disconnected." Heartbeats keep
+    // every hop convinced the connection is alive.
+    final senderHeartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
+      session
+          .sendFrame(const HeartbeatEnvelope().toBytes())
+          .catchError((Object _) {});
+    });
+    try {
+      await _runSenderInner(session, manifest, skip);
+    } finally {
+      senderHeartbeat.cancel();
+    }
+  }
+
+  Future<void> _runSenderInner(
+    PairedSession session,
+    TransferManifest manifest,
+    Map<DataCategory, int> skip,
+  ) async {
+
     for (final category in manifest.categories) {
       _processed[category] = 0;
+      _phase[category] = _CategoryPhase.preparing;
+      if (mounted) setState(() {});
       final n = skip[category] ?? 0;
+
+      Future<void> streamFromList<T>(
+        Future<List<T>> Function() reader,
+        Uint8List Function(T) encode,
+      ) async {
+        final records = await reader();
+        _phase[category] = _CategoryPhase.streaming;
+        if (mounted) setState(() {});
+        for (var i = 0; i < records.length; i++) {
+          if (i < n) continue;
+          await session.sendFrame(encode(records[i]));
+          _processed[category] = (_processed[category] ?? 0) + 1;
+          if (mounted) setState(() {});
+        }
+      }
+
       switch (category) {
         case DataCategory.sms:
-          final records = await SmsReader().readAll();
-          for (var i = 0; i < records.length; i++) {
-            if (i < n) continue;
-            await session.sendFrame(SmsRecordEnvelope(records[i]).toBytes());
-            _processed[category] = (_processed[category] ?? 0) + 1;
-            if (mounted) setState(() {});
-          }
+          await streamFromList<SmsRecord>(
+            () => SmsReader().readAll(),
+            (r) => SmsRecordEnvelope(r).toBytes(),
+          );
           break;
         case DataCategory.callLog:
-          final records = await CallLogReader().readAll();
-          for (var i = 0; i < records.length; i++) {
-            if (i < n) continue;
-            await session.sendFrame(CallLogRecordEnvelope(records[i]).toBytes());
-            _processed[category] = (_processed[category] ?? 0) + 1;
-            if (mounted) setState(() {});
-          }
+          await streamFromList<CallLogRecord>(
+            () => CallLogReader().readAll(),
+            (r) => CallLogRecordEnvelope(r).toBytes(),
+          );
           break;
         case DataCategory.contacts:
-          final records = (await ContactsReader().readAll())
-              .where((c) => !c.isGoogleSynced)
-              .toList(growable: false);
-          for (var i = 0; i < records.length; i++) {
-            if (i < n) continue;
-            await session.sendFrame(ContactRecordEnvelope(records[i]).toBytes());
-            _processed[category] = (_processed[category] ?? 0) + 1;
-            if (mounted) setState(() {});
-          }
+          await streamFromList<Contact>(
+            () async => (await ContactsReader().readAll())
+                .where((c) => !c.isGoogleSynced)
+                .toList(growable: false),
+            (r) => ContactRecordEnvelope(r).toBytes(),
+          );
           break;
         case DataCategory.calendar:
-          final records = await CalendarReader().readAll();
-          for (var i = 0; i < records.length; i++) {
-            if (i < n) continue;
-            await session.sendFrame(CalendarEventEnvelope(records[i]).toBytes());
-            _processed[category] = (_processed[category] ?? 0) + 1;
-            if (mounted) setState(() {});
-          }
+          await streamFromList<CalendarEvent>(
+            () => CalendarReader().readAll(),
+            (r) => CalendarEventEnvelope(r).toBytes(),
+          );
           break;
         case DataCategory.photos:
           await _streamPhotos(session, () {
@@ -186,6 +250,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           });
           break;
       }
+      _phase[category] = _CategoryPhase.done;
+      if (mounted) setState(() {});
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
     }
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
@@ -231,18 +297,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final cacheDir = (await getApplicationSupportDirectory()).path;
     final cache = await PhotoHashCache.open(cacheDir);
 
-    // Heartbeat: while we're chewing through the library, the TCP socket
-    // would otherwise sit idle for minutes. Wi-Fi power management on
-    // some OEMs / NAT timeouts on some routers will silently kill an
-    // idle connection. Sending one tick every 5s keeps the kernel and
-    // any hops in the path convinced the connection is alive — and is
-    // what the receiver needs to keep its incoming-frames stream from
-    // firing onDone.
-    final heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
-      session
-          .sendFrame(const HeartbeatEnvelope().toBytes())
-          .catchError((Object _) {});
-    });
+    // (Heartbeat is now global to the whole sender lifetime — see
+    // _runAsSender. No need to start a photos-specific one here.)
 
     // Pre-flight pass: hash every photo before any bytes go out, so we can
     // ask the receiver which it already has. The hash pass is the long
@@ -294,9 +350,16 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       // cache file from growing unboundedly across years of use.
       cache.retainOnly(liveUris);
       await cache.save();
-    } finally {
-      heartbeat.cancel();
+    } catch (_) {
+      // Honest fallthrough — the global heartbeat ticker is independent
+      // of the hashing pass, so leaving exception handling lighter here
+      // is fine.
     }
+
+    // Hashing complete; flip the row to streaming so the user sees the
+    // phase change.
+    _phase[DataCategory.photos] = _CategoryPhase.streaming;
+    if (mounted) setState(() {});
 
     // Send the hashes; await the receiver's skip list.
     await session.sendFrame(PhotoHashesEnvelope(
@@ -857,25 +920,37 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   Widget _categoryRow(TransferManifest manifest, DataCategory c) {
     final total = manifest.counts[c] ?? 0;
     final done = _processed[c] ?? 0;
-    final progress = total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0);
     final role = ref.read(transferStateProvider).role;
     final isReceiver = role == DeviceRole.receiver;
-    final isSenderHashingPhotos =
-        !isReceiver && c == DataCategory.photos && _hashed > 0 && done == 0;
+    final phase = _phase[c] ??
+        (isReceiver
+            // Receiver: derived from progress vs total because the
+            // receiver doesn't run the queued/preparing/streaming
+            // state machine — it just listens.
+            ? (done == 0 && total > 0
+                ? _CategoryPhase.queued
+                : (done < total ? _CategoryPhase.streaming : _CategoryPhase.done))
+            : _CategoryPhase.queued);
 
-    // All five categories have writers as of v0.7; receiver always shows
-    // the new/duplicate breakdown. The sender shows a hashing-phase
-    // status for photos, then progresses to bytes-sent once chunks flow.
-    final detail = isSenderHashingPhotos
-        ? 'Hashing $_hashed / $total'
-        : isReceiver
-            ? '$done / $total received '
-                '(${_writtenByCategory[c] ?? 0} new, '
-                '${_skippedByCategory[c] ?? 0} duplicates)'
-            : c == DataCategory.photos && _photosSkippedPreflight > 0
-                ? '$done / $total sent '
-                    '($_photosSkippedPreflight skipped — already on the other phone)'
-                : '$done / $total';
+    // Progress bar is the unit-of-work fraction. For sender during the
+    // photo hashing pass, that's _hashed/_hashTotal; otherwise done/total.
+    final progress = c == DataCategory.photos &&
+            !isReceiver &&
+            phase == _CategoryPhase.preparing &&
+            _hashTotal > 0
+        ? (_hashed / _hashTotal).clamp(0.0, 1.0)
+        : (total == 0 ? 1.0 : (done / total).clamp(0.0, 1.0));
+
+    final phaseLabel = _phaseLabel(c, phase, isReceiver: isReceiver);
+    final phaseColor = _phaseColor(phase);
+    final detail = _detailLine(
+      c,
+      phase,
+      total: total,
+      done: done,
+      isReceiver: isReceiver,
+    );
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(
@@ -886,6 +961,27 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               Icon(_iconFor(c), size: 18),
               const SizedBox(width: 8),
               Expanded(child: Text(_labelFor(c))),
+              if (phaseLabel != null) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: phaseColor,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    phaseLabel,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
               Text(detail,
                   style: const TextStyle(
                     fontFeatures: [FontFeature.tabularFigures()],
@@ -897,6 +993,61 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         ],
       ),
     );
+  }
+
+  String? _phaseLabel(
+    DataCategory c,
+    _CategoryPhase phase, {
+    required bool isReceiver,
+  }) {
+    switch (phase) {
+      case _CategoryPhase.queued:
+        return 'Queued';
+      case _CategoryPhase.preparing:
+        if (c == DataCategory.photos && !isReceiver) return 'Hashing';
+        return 'Reading';
+      case _CategoryPhase.streaming:
+        return null; // Detail line carries the count; chip would be redundant.
+      case _CategoryPhase.done:
+        return 'Done';
+    }
+  }
+
+  Color _phaseColor(_CategoryPhase phase) {
+    switch (phase) {
+      case _CategoryPhase.queued:
+        return Colors.grey;
+      case _CategoryPhase.preparing:
+        return Theme.of(context).colorScheme.primary;
+      case _CategoryPhase.streaming:
+        return Theme.of(context).colorScheme.primary;
+      case _CategoryPhase.done:
+        return Colors.green;
+    }
+  }
+
+  String _detailLine(
+    DataCategory c,
+    _CategoryPhase phase, {
+    required int total,
+    required int done,
+    required bool isReceiver,
+  }) {
+    if (c == DataCategory.photos &&
+        !isReceiver &&
+        phase == _CategoryPhase.preparing) {
+      return 'Hashing $_hashed / $_hashTotal';
+    }
+    if (isReceiver) {
+      return '$done / $total received '
+          '(${_writtenByCategory[c] ?? 0} new, '
+          '${_skippedByCategory[c] ?? 0} duplicates)';
+    }
+    if (c == DataCategory.photos && _photosSkippedPreflight > 0) {
+      return '$done / $total sent '
+          '($_photosSkippedPreflight skipped — already on the other phone)';
+    }
+    return '$done / $total';
   }
 
   IconData _iconFor(DataCategory c) {

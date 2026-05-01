@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:permission_handler/permission_handler.dart';
 
 import '../state/transfer_state.dart';
@@ -42,6 +44,29 @@ class CategoryProbe {
     return {for (final s in results) s.category: s};
   }
 
+  /// Streaming variant — emits each [CategoryStatus] as soon as that
+  /// category's probe completes, so the UI can fill in fast results
+  /// (sms/call-log/contacts/calendar all sub-second) immediately and
+  /// only the slow photos summary keeps a spinner. The Select screen's
+  /// `probeAllCategoryCounts` uses this to avoid the "all five spinners
+  /// stay until the slowest finishes" Future.wait UX.
+  Stream<CategoryStatus> probeStream() async* {
+    final controller = StreamController<CategoryStatus>();
+    var pending = 5;
+    void onResult(CategoryStatus s) {
+      controller.add(s);
+      if (--pending == 0) controller.close();
+    }
+
+    _probeSms().then(onResult);
+    _probeCallLog().then(onResult);
+    _probeContacts().then(onResult);
+    _probeCalendar().then(onResult);
+    _probeMedia().then(onResult);
+
+    yield* controller.stream;
+  }
+
   Future<CategoryStatus> _probeSms() => _probeCounting(
         category: DataCategory.sms,
         hasPermission: _sms.hasReadPermission,
@@ -74,14 +99,34 @@ class CategoryProbe {
         permissionState: PermissionState.denied,
       );
     }
+    // summary() iterates the full MediaStore cursor to sum file sizes
+    // for the byte-estimate; on a 30k-photo library that's seconds, on
+    // pathological cases (slow SD card, lots of cloud-stub stale rows)
+    // it can be much longer. Time-box to 8 seconds; if it doesn't return
+    // we fall back to count-only and let the UI display the count
+    // without the size estimate. The user can still proceed.
     try {
-      final s = await _media.summary();
+      final s = await _media.summary().timeout(const Duration(seconds: 8));
       return CategoryStatus(
         category: DataCategory.photos,
         permissionState: PermissionState.granted,
         count: s.count,
         estimatedBytes: s.totalBytes,
       );
+    } on TimeoutException {
+      try {
+        final n = await _media.count().timeout(const Duration(seconds: 4));
+        return CategoryStatus(
+          category: DataCategory.photos,
+          permissionState: PermissionState.granted,
+          count: n,
+        );
+      } catch (_) {
+        return const CategoryStatus(
+          category: DataCategory.photos,
+          permissionState: PermissionState.granted,
+        );
+      }
     } catch (_) {
       return const CategoryStatus(
         category: DataCategory.photos,

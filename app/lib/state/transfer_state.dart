@@ -205,8 +205,18 @@ class TransferStateNotifier extends StateNotifier<TransferState> {
   /// Fan out to all five category channels in parallel and store the result.
   /// Idempotent — safe to call again after the user grants a new permission.
   Future<void> probeAllCategoryCounts() async {
-    final statuses = await _probe.probeAll();
-    state = state.copyWith(categoryStatuses: statuses);
+    // Streaming variant: emit each category's status as soon as its probe
+    // finishes, so fast categories (sms / call-log / contacts / calendar
+    // are sub-second) show their counts immediately while only the slow
+    // photo summary keeps a spinner. Future.wait would block all five
+    // until the slowest finishes — hence v0.14.1's "spinners forever" fix.
+    final building = Map<DataCategory, CategoryStatus>.from(
+      state.categoryStatuses,
+    );
+    await for (final status in _probe.probeStream()) {
+      building[status.category] = status;
+      state = state.copyWith(categoryStatuses: Map.of(building));
+    }
   }
 
   void setScanResult(ScanResult result) =>
