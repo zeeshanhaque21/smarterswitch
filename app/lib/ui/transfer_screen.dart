@@ -155,26 +155,72 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
-    // Wait briefly for the receiver's ResumeEnvelope so we can skip records
-    // it already wrote in a prior session (Wi-Fi drop / app crash). On
-    // first-ever transfer or v0.11-receiver back-compat, no Resume comes —
-    // we time out and treat all watermarks as 0 (= "start from the top").
-    final skip = await _awaitReceiverResume(session);
-    if (skip.values.any((n) => n > 0) && mounted) {
-      setState(() {});
-    }
+    // One persistent listener for the whole sender lifecycle. Earlier
+    // versions used two short-lived listeners (one for Resume, then a
+    // listener-less stream phase) — that broke as soon as we needed
+    // RecordAck flow back from the receiver to drive progress.
+    final resumeCompleter = Completer<Map<DataCategory, int>>();
+    final sub = session.incomingFrames().listen((frame) {
+      try {
+        final env = TransferEnvelope.fromBytes(frame);
+        switch (env) {
+          case ResumeEnvelope(:final watermarks):
+            if (!resumeCompleter.isCompleted) {
+              resumeCompleter.complete(watermarks);
+            }
+            break;
+          case RecordAckEnvelope(:final category, :final count):
+            // Drive the sender's progress bar off the receiver's
+            // confirmed-integrated count. Both phones now show the
+            // same number, end of mismatch.
+            _processed[category] = count;
+            if (mounted) setState(() {});
+            break;
+          default:
+            // Heartbeats and any other inbound frames during the
+            // sender pass — ignore.
+            break;
+        }
+      } catch (_) {/* malformed frame; drop */}
+    });
 
-    // Initialize all categories to queued so the rows render the right
-    // state from the start instead of looking idle.
-    for (final c in manifest.categories) {
-      _phase[c] = _CategoryPhase.queued;
-    }
-    if (mounted) setState(() {});
+    try {
+      // 120s window: covers the user tapping Accept on the receiver's
+      // Scan screen, granting the read permissions, and the receiver
+      // building its dedup indexes. Resume is the receiver's
+      // "ready to receive" handshake — we can't start streaming
+      // before it arrives or first-batch frames will land in a
+      // listenerless broadcast stream and disappear.
+      final Map<DataCategory, int> skip;
+      try {
+        skip = await resumeCompleter.future
+            .timeout(const Duration(seconds: 120));
+      } on TimeoutException {
+        throw StateError(
+          'The other phone never confirmed it was ready to receive. '
+          'Make sure it has tapped "Accept and start transfer" on the '
+          'Review screen, then try again.',
+        );
+      }
 
-    // Heartbeat is now session-level (SecureSocketSession runs a 5s
-    // ticker for the full socket lifetime). No transfer-specific timer
-    // needed here.
-    await _runSenderInner(session, manifest, skip);
+      if (skip.values.any((n) => n > 0) && mounted) {
+        setState(() {});
+      }
+
+      // Initialize all categories to queued so the rows render the right
+      // state from the start instead of looking idle.
+      for (final c in manifest.categories) {
+        _phase[c] = _CategoryPhase.queued;
+      }
+      if (mounted) setState(() {});
+
+      // Heartbeat is session-level (SecureSocketSession runs a 5s
+      // ticker for the full socket lifetime). No transfer-specific
+      // timer needed here.
+      await _runSenderInner(session, manifest, skip);
+    } finally {
+      await sub.cancel();
+    }
   }
 
   Future<void> _runSenderInner(
@@ -184,11 +230,19 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   ) async {
 
     for (final category in manifest.categories) {
-      _processed[category] = 0;
+      // Don't reset _processed[category] here: the receiver's RecordAck
+      // listener already keeps it in lock-step with confirmed-integrated
+      // records, and resetting would clobber acks that have already
+      // arrived for an interleaved category.
+      _processed[category] ??= 0;
       _phase[category] = _CategoryPhase.preparing;
       if (mounted) setState(() {});
       final n = skip[category] ?? 0;
 
+      // Progress is driven by RecordAckEnvelope from the receiver (see
+      // _runAsSender's persistent listener); we don't increment
+      // _processed here. Sending a record is "in flight" — only after
+      // the receiver acks does the bar tick forward.
       Future<void> streamFromList<T>(
         Future<List<T>> Function() reader,
         Uint8List Function(T) encode,
@@ -199,8 +253,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         for (var i = 0; i < records.length; i++) {
           if (i < n) continue;
           await session.sendFrame(encode(records[i]));
-          _processed[category] = (_processed[category] ?? 0) + 1;
-          if (mounted) setState(() {});
         }
       }
 
@@ -243,46 +295,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
     }
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
-  }
-
-  /// Subscribe to the session's incoming frames and wait for a
-  /// ResumeEnvelope from the receiver. The Resume envelope doubles as the
-  /// receiver's "I'm ready, start streaming" handshake — it's only sent
-  /// once the receiver has built its dedup indexes and attached its
-  /// frame listener (see _runAsReceiver). Without this gate the sender
-  /// would stream records into the void during the receiver's
-  /// Scan-screen tap → permission prompts → readAll() window, and
-  /// SecureSocketSession's broadcast stream would silently drop them.
-  ///
-  /// 120s timeout: long enough for the user to walk through the Scan
-  /// screen on the NEW phone, grant permissions, and let the receiver
-  /// build its dedup indexes. If we time out, raise instead of
-  /// streaming blind — falling back to skip={} caused the v0.16.4
-  /// "receiver hangs after data sent" regression because by then the
-  /// receiver was past its first records-arrival window.
-  Future<Map<DataCategory, int>> _awaitReceiverResume(
-    PairedSession session,
-  ) async {
-    final completer = Completer<Map<DataCategory, int>>();
-    final sub = session.incomingFrames().listen((frame) {
-      try {
-        final env = TransferEnvelope.fromBytes(frame);
-        if (env is ResumeEnvelope && !completer.isCompleted) {
-          completer.complete(env.watermarks);
-        }
-      } catch (_) {/* not for us */}
-    });
-    try {
-      return await completer.future.timeout(const Duration(seconds: 120));
-    } on TimeoutException {
-      throw StateError(
-        'The other phone never confirmed it was ready to receive. '
-        'Make sure it has tapped "Accept and start transfer" on the '
-        'Review screen, then try again.',
-      );
-    } finally {
-      await sub.cancel();
-    }
   }
 
   Future<void> _streamPhotos(
@@ -472,6 +484,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       try {
         await wals[c]?.ack(next);
       } catch (_) {/* WAL ack regression — ignore */}
+      // Tell the sender we've processed (deduped + queued or skipped)
+      // this record. Sender drives its progress bar off these acks
+      // instead of its optimistic per-send increment, so both phones
+      // show the same confirmed-integrated count.
+      try {
+        await session
+            .sendFrame(RecordAckEnvelope(category: c, count: next).toBytes());
+      } catch (_) {/* network blip; sender will surface via progress lag */}
     }
 
     // Build per-category dedup indexes from what already exists locally,
@@ -743,6 +763,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               // Sender's keepalive tick during the photo pre-flight pass.
               // No-op — we only need it to keep the TCP socket warm and
               // signal "still working, hold on."
+              break;
+            case RecordAckEnvelope():
+              // The receiver emits these; the sender consumes them. If
+              // we land here it's a stray frame — drop it.
               break;
           }
         } catch (e) {

@@ -140,6 +140,14 @@ sealed class TransferEnvelope {
         );
       case 'transfer_done':
         return const TransferDoneEnvelope();
+      case 'record_ack':
+        return RecordAckEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+            orElse: () => DataCategory.sms,
+          ),
+          count: (raw['count'] as num?)?.toInt() ?? 0,
+        );
       case 'heartbeat':
         return const HeartbeatEnvelope();
       case 'resume':
@@ -388,6 +396,24 @@ class TransferDoneEnvelope extends TransferEnvelope {
   @override
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'transfer_done',
+      })));
+}
+
+/// Receiver → sender, emitted after each record envelope is processed
+/// (dedup decision made and the record queued for write or marked
+/// skipped). [count] is the receiver's running per-category total of
+/// processed records, so the sender's progress bar can drive directly
+/// off the receiver's confirmed-integrated count instead of its own
+/// optimistic send counter.
+class RecordAckEnvelope extends TransferEnvelope {
+  const RecordAckEnvelope({required this.category, required this.count});
+  final DataCategory category;
+  final int count;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'record_ack',
+        'category': category.name,
+        'count': count,
       })));
 }
 
