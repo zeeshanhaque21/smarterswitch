@@ -155,7 +155,26 @@ class SecureSocketSession implements PairedSession {
   Uint8List? _sessionKey;
   static final _aes = AesGcm.with256bits();
 
+  /// Returns the next newline-terminated line from the peer. Critically,
+  /// drains any bytes already sitting in [_handshakeBuffer] before parking
+  /// on a completer — TCP can coalesce two handshake lines (e.g. `OK\n`
+  /// followed by `PUBKEY ...\n`) into a single read, in which case
+  /// [_onData] consumes only the first line and stashes the rest. Without
+  /// this drain the next call would wait for bytes that have already
+  /// arrived, and the 15s handshake timeout would fire even though the
+  /// peer did its job.
   Future<String> _readHandshakeLine() {
+    final buffered = _handshakeBuffer.toBytes();
+    for (var i = 0; i < buffered.length; i++) {
+      if (buffered[i] == 0x0a) {
+        final line = utf8.decode(buffered.sublist(0, i));
+        _handshakeBuffer.clear();
+        if (i + 1 < buffered.length) {
+          _handshakeBuffer.add(buffered.sublist(i + 1));
+        }
+        return Future.value(line);
+      }
+    }
     final c = Completer<String>();
     _readLineCompleter = c;
     return c.future;
