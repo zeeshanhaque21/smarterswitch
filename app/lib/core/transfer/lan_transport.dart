@@ -24,6 +24,11 @@ class LanTransport implements Transport {
   final String serviceType;
 
   ServerSocket? _server;
+
+  /// Port the receiver's TCP server is bound to after [advertise]. Null
+  /// before advertise. Surfaced so the manual-pairing UI can display
+  /// `<ip>:<port>` for the user to type on the sender side.
+  int? get boundPort => _server?.port;
   nsd.Registration? _registration;
   nsd.Discovery? _discovery;
 

@@ -3,8 +3,10 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../core/transfer/lan_transport.dart';
@@ -18,6 +20,7 @@ enum _PairPhase {
   receiverWaiting, // advertising, showing PIN, waiting for sender to connect
   senderDiscovering, // browsing for peers
   senderEnterPin, // a peer was tapped, asking for the PIN
+  senderManualEntry, // typing host:port + PIN (no discovery)
   connecting, // sender → "PIN OK" round trip in progress
   connected,
   error,
@@ -76,6 +79,18 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   String _pin = '';
   String _pinInput = '';
   String? _errorMessage;
+
+  /// Receiver-side: this device's IPv4 on the current Wi-Fi. Populated
+  /// after we successfully bind the TCP server in advertise(). Surfaced
+  /// on the receiverWaiting screen so the sender's user can type it in
+  /// when discovery isn't available (no shared mDNS, Wi-Fi Direct
+  /// flaky, etc).
+  String? _receiverIp;
+  int? _receiverPort;
+
+  /// Sender-side manual-entry fields.
+  String _manualHost = '';
+  String _manualPort = '';
 
   /// Defaults to Wi-Fi Direct (works without a shared router). User can
   /// flip the link in the role picker to use the LAN-mDNS path instead.
@@ -141,7 +156,24 @@ class _PairScreenState extends ConsumerState<PairScreen> {
       final myName = await _myDeviceName();
       await transport.advertise(displayName: myName);
       if (!mounted) return;
-      setState(() => _statusLine = 'Waiting for the other phone…');
+      // Capture the bound IP+port so the receiver-waiting screen can
+      // show them for manual pairing (sender types these in if
+      // discovery isn't available). Only LanTransport exposes the
+      // bound port — Wi-Fi Direct uses a fixed port + GO IP that the
+      // sender already knows.
+      String? ip;
+      int? port;
+      if (transport is LanTransport) {
+        port = transport.boundPort;
+        try {
+          ip = await NetworkInfo().getWifiIP();
+        } catch (_) {/* permission or no Wi-Fi — leave ip null */}
+      }
+      setState(() {
+        _statusLine = 'Waiting for the other phone…';
+        _receiverIp = ip;
+        _receiverPort = port;
+      });
       final session = await transport.accept(pin: pin);
       if (!mounted) return;
       ref.read(transferStateProvider.notifier).setPairedSession(
@@ -273,6 +305,76 @@ class _PairScreenState extends ConsumerState<PairScreen> {
     }
   }
 
+  /// Sender-side: enter the manual-pairing form. No discovery, no
+  /// Wi-Fi Direct probing — straight to a TCP connect on a host:port
+  /// the user types in.
+  void _enterManualMode() {
+    setState(() {
+      _phase = _PairPhase.senderManualEntry;
+      _manualHost = '';
+      _manualPort = '';
+      _pinInput = '';
+      _errorMessage = null;
+    });
+  }
+
+  Future<void> _attemptManualConnect() async {
+    final host = _manualHost.trim();
+    final port = int.tryParse(_manualPort.trim());
+    if (host.isEmpty || port == null) {
+      setState(() => _errorMessage =
+          'Enter the IP address and port shown on the other phone.');
+      return;
+    }
+    setState(() {
+      _phase = _PairPhase.connecting;
+      _statusLine = 'Connecting to $host:$port…';
+      _errorMessage = null;
+    });
+    try {
+      final socket = await Socket.connect(
+        host,
+        port,
+        timeout: const Duration(seconds: 10),
+      );
+      final session = await SecureSocketSession.handshakeAsConnector(
+        socket: socket,
+        peerDisplayName: '$host:$port',
+        pin: _pinInput,
+      );
+      if (!mounted) return;
+      ref.read(transferStateProvider.notifier).setPairedSession(
+            session: session,
+            transportKind: 'Manual',
+            role: DeviceRole.sender,
+          );
+      setState(() => _phase = _PairPhase.connected);
+      if (mounted) context.go('/select');
+    } on PinMismatchException {
+      if (!mounted) return;
+      setState(() {
+        _phase = _PairPhase.senderManualEntry;
+        _errorMessage = 'PIN didn\'t match. Try again.';
+      });
+    } on HandshakeTimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _phase = _PairPhase.error;
+        _errorMessage =
+            'The other phone didn\'t respond.\n\n'
+            'Check both phones are on the same Wi-Fi (or that one phone\'s '
+            'hotspot is enabled and the other has joined it), and that the '
+            'IP and port match what\'s shown on the receiver.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _phase = _PairPhase.error;
+        _errorMessage = 'Connection failed: $e';
+      });
+    }
+  }
+
   Future<void> _resetToRolePicker() async {
     await _peerSub?.cancel();
     _peerSub = null;
@@ -318,6 +420,8 @@ class _PairScreenState extends ConsumerState<PairScreen> {
         return _senderDiscovering();
       case _PairPhase.senderEnterPin:
         return _senderEnterPin();
+      case _PairPhase.senderManualEntry:
+        return _senderManualEntry();
       case _PairPhase.connecting:
         return _busy(_statusLine);
       case _PairPhase.connected:
@@ -409,6 +513,14 @@ class _PairScreenState extends ConsumerState<PairScreen> {
                 ),
               ),
             ),
+          Center(
+            child: TextButton(
+              onPressed: _enterManualMode,
+              child: const Text(
+                'Discovery not working? Connect manually →',
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -460,6 +572,94 @@ class _PairScreenState extends ConsumerState<PairScreen> {
               const SizedBox(width: 12),
               Text(_statusLine),
             ],
+          ),
+          if (_receiverIp != null && _receiverPort != null) ...[
+            const SizedBox(height: 24),
+            const Divider(),
+            const SizedBox(height: 12),
+            Text(
+              'Or type this on the OLD phone:',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 4),
+            SelectableText(
+              '${_receiverIp!}:${_receiverPort!}',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Tap "Connect manually" on the OLD phone, enter the IP and port '
+              'above, plus the PIN — works whenever both phones share a Wi-Fi.',
+              style: Theme.of(context).textTheme.bodySmall,
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _senderManualEntry() {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SizedBox(height: 16),
+          Text(
+            'Type the IP, port, and PIN shown on the NEW phone',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'IP address',
+              hintText: '192.168.1.50',
+            ),
+            keyboardType: TextInputType.number,
+            inputFormatters: [
+              FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+            ],
+            onChanged: (v) => setState(() => _manualHost = v),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'Port',
+              hintText: '54321',
+            ),
+            keyboardType: TextInputType.number,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+            ],
+            onChanged: (v) => setState(() => _manualPort = v),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            decoration: InputDecoration(
+              border: const OutlineInputBorder(),
+              labelText: 'PIN',
+              hintText: '123456',
+              errorText: _errorMessage,
+            ),
+            keyboardType: TextInputType.number,
+            maxLength: 6,
+            onChanged: (v) => setState(() {
+              _pinInput = v.replaceAll(RegExp(r'[^0-9]'), '');
+            }),
+          ),
+          const SizedBox(height: 12),
+          FilledButton(
+            onPressed: (_manualHost.trim().isNotEmpty &&
+                    _manualPort.trim().isNotEmpty &&
+                    _pinInput.length == 6)
+                ? _attemptManualConnect
+                : null,
+            child: const Text('Connect'),
           ),
         ],
       ),
