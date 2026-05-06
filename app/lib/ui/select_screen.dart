@@ -155,7 +155,9 @@ class _SelectScreenState extends ConsumerState<SelectScreen> {
         return;
       }
     }
-    if (mounted) context.go('/scan');
+    // Sender goes straight to transfer — no need to review what they just
+    // picked. The receiver sees ScanScreen to accept.
+    if (mounted) context.go('/transfer');
   }
 
   int _selectedItemTotal(TransferState state) {
