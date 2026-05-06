@@ -11,7 +11,6 @@ import 'package:permission_handler/permission_handler.dart';
 import '../core/dedup/calendar_dedup.dart';
 import '../core/dedup/call_log_dedup.dart';
 import '../core/dedup/contacts_dedup.dart';
-import '../core/dedup/photos_dedup.dart';
 import '../core/dedup/sms_dedup.dart';
 import '../core/model/calendar_event.dart';
 import '../core/model/call_log_record.dart';
@@ -21,7 +20,6 @@ import '../core/model/sms_record.dart';
 import '../core/transfer/manifest.dart';
 import '../core/transfer/photo_hash_cache.dart';
 import '../core/transfer/transport.dart';
-import '../core/transfer/wal.dart';
 import '../platform/calendar_reader.dart';
 import '../platform/call_log_reader.dart';
 import '../platform/category_counts.dart';
@@ -168,33 +166,15 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
-    // One persistent listener for the whole sender lifecycle. Earlier
-    // versions used two short-lived listeners (one for Resume, then a
-    // listener-less stream phase) — that broke as soon as we needed
-    // RecordAck flow back from the receiver to drive progress.
-    final resumeCompleter = Completer<Map<DataCategory, int>>();
+    // Wait for receiver's Resume (confirms listener is attached).
+    final resumeCompleter = Completer<void>();
     final sub = session.incomingFrames().listen((frame) {
       _framesSeen += 1;
       try {
         final env = TransferEnvelope.fromBytes(frame);
         _lastFrameKind = env.runtimeType.toString();
-        switch (env) {
-          case ResumeEnvelope(:final watermarks):
-            if (!resumeCompleter.isCompleted) {
-              resumeCompleter.complete(watermarks);
-            }
-            break;
-          case RecordAckEnvelope(:final category, :final count):
-            // Drive the sender's progress bar off the receiver's
-            // confirmed-integrated count. Both phones now show the
-            // same number, end of mismatch.
-            _processed[category] = count;
-            if (mounted) setState(() {});
-            break;
-          default:
-            // Heartbeats and any other inbound frames during the
-            // sender pass — ignore.
-            break;
+        if (env is ResumeEnvelope && !resumeCompleter.isCompleted) {
+          resumeCompleter.complete();
         }
       } catch (e) {
         _frameError = e.toString();
@@ -203,16 +183,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     });
 
     try {
-      // 120s window: covers the user tapping Accept on the receiver's
-      // Scan screen, granting the read permissions, and the receiver
-      // building its dedup indexes. Resume is the receiver's
-      // "ready to receive" handshake — we can't start streaming
-      // before it arrives or first-batch frames will land in a
-      // listenerless broadcast stream and disappear.
-      final Map<DataCategory, int> skip;
       try {
-        skip = await resumeCompleter.future
-            .timeout(const Duration(seconds: 120));
+        await resumeCompleter.future.timeout(const Duration(seconds: 120));
       } on TimeoutException {
         throw StateError(
           'The other phone never confirmed it was ready to receive. '
@@ -221,21 +193,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         );
       }
 
-      if (skip.values.any((n) => n > 0) && mounted) {
-        setState(() {});
-      }
-
-      // Initialize all categories to queued so the rows render the right
-      // state from the start instead of looking idle.
       for (final c in manifest.categories) {
         _phase[c] = _CategoryPhase.queued;
       }
       if (mounted) setState(() {});
 
-      // Heartbeat is session-level (SecureSocketSession runs a 5s
-      // ticker for the full socket lifetime). No transfer-specific
-      // timer needed here.
-      await _runSenderInner(session, manifest, skip);
+      await _runSenderInner(session, manifest);
     } finally {
       await sub.cancel();
     }
@@ -244,23 +207,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   Future<void> _runSenderInner(
     PairedSession session,
     TransferManifest manifest,
-    Map<DataCategory, int> skip,
   ) async {
-
     for (final category in manifest.categories) {
-      // Don't reset _processed[category] here: the receiver's RecordAck
-      // listener already keeps it in lock-step with confirmed-integrated
-      // records, and resetting would clobber acks that have already
-      // arrived for an interleaved category.
-      _processed[category] ??= 0;
       _phase[category] = _CategoryPhase.preparing;
       if (mounted) setState(() {});
-      final n = skip[category] ?? 0;
 
-      // Progress is driven by RecordAckEnvelope from the receiver (see
-      // _runAsSender's persistent listener); we don't increment
-      // _processed here. Sending a record is "in flight" — only after
-      // the receiver acks does the bar tick forward.
       Future<void> streamFromList<T>(
         Future<List<T>> Function() reader,
         Uint8List Function(T) encode,
@@ -268,17 +219,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         final records = await reader();
         _phase[category] = _CategoryPhase.streaming;
         if (mounted) setState(() {});
-        var sentCount = n; // Already-acked from resume
         for (var i = 0; i < records.length; i++) {
-          if (i < n) continue;
           await session.sendFrame(encode(records[i]));
-          sentCount++;
-          _sent[category] = sentCount;
-        }
-        // Wait for receiver to ack all sent records before proceeding.
-        // This keeps both progress bars synchronized.
-        while ((_processed[category] ?? 0) < sentCount) {
-          await Future<void>.delayed(const Duration(milliseconds: 50));
+          _sent[category] = i + 1;
+          if (mounted) setState(() {});
         }
       }
 
@@ -472,110 +416,32 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
-    // The receiver never went through SelectScreen, so the per-category
-    // read permissions it needs to build dedup indexes (READ_CALL_LOG /
-    // READ_SMS / etc.) are not yet granted. Request them up-front for
-    // exactly the manifest's categories. Any one of them being denied
-    // surfaces as a PlatformException("PERMISSION_DENIED ...") deep
-    // inside the dedup pass — request first so the user sees the
-    // standard system prompt instead of a crash dialog.
+    // Step 1: Request permissions needed to write data later.
     final neededPermissions = <Permission>{
       for (final c in manifest.categories) ...permissionsFor(c),
     };
     for (final p in neededPermissions) {
       try {
         await p.request();
-      } catch (_) {/* best-effort; readAll will surface a real error */}
+      } catch (_) {}
     }
 
-    // Per-category WAL: persists the count of records this device has
-    // received per category across sessions. After a Wi-Fi drop, the
-    // next session reads these watermarks and we ship them to the sender
-    // via ResumeEnvelope so it skips records we already have. Photos use
-    // sha256-based dedup (the existing pre-flight skip-list) instead of
-    // ordinal sequencing — they don't get a WAL.
-    final walDir = (await getApplicationSupportDirectory()).path;
-    final wals = <DataCategory, CategoryWal>{
-      for (final c in manifest.categories
-          .where((c) => c != DataCategory.photos))
-        c: await CategoryWal.open('$walDir/${c.name}.wal'),
-    };
-    final receivedByCategory = <DataCategory, int>{
-      for (final e in wals.entries) e.key: e.value.watermark,
-    };
+    // Buffers to collect all incoming records during transfer.
+    // Dedup and write happen AFTER TransferDoneEnvelope.
+    final incomingSms = <SmsRecord>[];
+    final incomingCallLog = <CallLogRecord>[];
+    final incomingContacts = <Contact>[];
+    final incomingCalendar = <CalendarEvent>[];
 
-    Future<void> ackReceived(DataCategory c) async {
-      final next = (receivedByCategory[c] ?? 0) + 1;
-      receivedByCategory[c] = next;
-      try {
-        await wals[c]?.ack(next);
-      } catch (_) {/* WAL ack regression — ignore */}
-      // Tell the sender we've processed (deduped + queued or skipped)
-      // this record. Sender drives its progress bar off these acks
-      // instead of its optimistic per-send increment, so both phones
-      // show the same confirmed-integrated count.
-      try {
-        await session
-            .sendFrame(RecordAckEnvelope(category: c, count: next).toBytes());
-      } catch (_) {/* network blip; sender will surface via progress lag */}
-    }
-
-    // Build per-category dedup indexes from what already exists locally,
-    // so incoming records that match get skipped instead of duplicated.
-    //
-    // Crucial ordering: this must finish BEFORE we send ResumeEnvelope.
-    // SecureSocketSession.incomingFrames() is backed by a broadcast
-    // stream that drops events for time windows where no listener is
-    // attached. Earlier versions sent Resume first and built the
-    // indexes second; the sender immediately started streaming records
-    // while the receiver was still readAll()-ing local data, and those
-    // first-batch frames vanished — the receiver then hung waiting for
-    // CategoryDone / TransferDone that never arrived after.
-    final callLogIndex = manifest.categories.contains(DataCategory.callLog)
-        ? CallLogDedup.indexOf(await CallLogReader().readAll())
-        : <CallLogDedupKey>{};
-    final contactsKeys = manifest.categories.contains(DataCategory.contacts)
-        ? <Set<String>>[
-            for (final c in await ContactsReader().readAll())
-              ContactsDedup.matchKeysFor(c),
-          ]
-        : <Set<String>>[];
-    final calendarIndex = manifest.categories.contains(DataCategory.calendar)
-        ? CalendarDedup.indexOf(await CalendarReader().readAll())
-        : <CalendarDedupKey>{};
-    final smsIndex = manifest.categories.contains(DataCategory.sms)
-        ? SmsDedup.indexOf(await SmsReader().readAll())
-        : <SmsDedupKey>{};
-
-    final pendingCallLogWrites = <CallLogRecord>[];
-    final pendingContactWrites = <Contact>[];
-    final pendingCalendarWrites = <CalendarEvent>[];
-    final pendingSmsWrites = <SmsRecord>[];
-
-    // Photos: streaming-by-sha256. Either we're skipping (sha256 already on
-    // device) or actively writing (MediaStore stream open in Kotlin land).
-    // v0.13: also collect pHashes from the local library so the
-    // receiver can surface fuzzy matches (re-encoded copies) on
-    // PhotoHashesEnvelope receipt.
+    // Photos still use streaming write (too large to buffer).
     final mediaReader = MediaReader();
     final localMediaShas = <String>{};
-    final localMediaPHashes = <int>[];
-    if (manifest.categories.contains(DataCategory.photos)) {
-      for (final m in await mediaReader.readMetadata()) {
-        try {
-          localMediaShas.add(await mediaReader.readSha256(m.uri));
-          if (m.kind == MediaKind.image) {
-            final ph = await mediaReader.computePHash(m.uri);
-            if (ph != null) localMediaPHashes.add(ph);
-          }
-        } catch (_) {/* file disappeared */}
-      }
-    }
     String? activeMediaSha;
     bool skippingActiveMedia = false;
 
     final completer = Completer<void>();
 
+    // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
       (frame) {
         _framesSeen += 1;
@@ -584,104 +450,45 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           _lastFrameKind = env.runtimeType.toString();
           switch (env) {
             case ManifestEnvelope():
-              // Already handled at the WaitingForSourceScreen step; ignore
-              // a duplicate here.
               break;
+            // Step 3: Buffer all incoming records (no dedup yet).
             case SmsRecordEnvelope(:final record):
-              if (SmsDedup.isDuplicate(smsIndex, record)) {
-                _skippedByCategory[DataCategory.sms] =
-                    (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
-              } else {
-                pendingSmsWrites.add(record);
-              }
+              incomingSms.add(record);
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
-              ackReceived(DataCategory.sms);
               if (mounted) setState(() {});
               break;
             case CallLogRecordEnvelope(:final record):
-              if (CallLogDedup.isDuplicate(callLogIndex, record)) {
-                _skippedByCategory[DataCategory.callLog] =
-                    (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
-              } else {
-                pendingCallLogWrites.add(record);
-              }
+              incomingCallLog.add(record);
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
-              ackReceived(DataCategory.callLog);
               if (mounted) setState(() {});
               break;
             case ContactRecordEnvelope(:final record):
-              final keys = ContactsDedup.matchKeysFor(record);
-              final isDup = keys.isNotEmpty &&
-                  contactsKeys.any((existing) =>
-                      existing.intersection(keys).length == keys.length);
-              if (isDup) {
-                _skippedByCategory[DataCategory.contacts] =
-                    (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
-              } else {
-                pendingContactWrites.add(record);
-              }
+              incomingContacts.add(record);
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
-              ackReceived(DataCategory.contacts);
               if (mounted) setState(() {});
               break;
             case CalendarEventEnvelope(:final record):
-              if (CalendarDedup.isDuplicate(calendarIndex, record)) {
-                _skippedByCategory[DataCategory.calendar] =
-                    (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
-              } else {
-                pendingCalendarWrites.add(record);
-              }
+              incomingCalendar.add(record);
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
-              ackReceived(DataCategory.calendar);
               if (mounted) setState(() {});
               break;
             case PhotoHashesEnvelope(:final entries):
-              // Exact sha256 matches → skip (existing v0.9 behavior).
               final skip = <String>[];
-              var fuzzyCount = 0;
               for (final e in entries) {
                 if (localMediaShas.contains(e.sha256)) {
                   skip.add(e.sha256);
-                  continue;
                 }
-                // Fuzzy: incoming pHash within threshold of any local
-                // pHash. v0.13 auto-resolves these as "keep both" — the
-                // sender still streams the file, receiver writes it as a
-                // new entry, the user sees the duplicate visually but no
-                // data is lost. The mid-transfer conflict-review UI gate
-                // is v0.14 work.
-                final ph = e.pHash;
-                if (ph == null) continue;
-                for (final localPh in localMediaPHashes) {
-                  if (PhotosDedup.hammingDistance64(ph, localPh) <=
-                      PhotosDedup.defaultPhashThreshold) {
-                    fuzzyCount += 1;
-                    break;
-                  }
-                }
-              }
-              if (fuzzyCount > 0) {
-                debugPrint(
-                  'v0.13 pHash: $fuzzyCount near-match photos auto-'
-                  'resolved as Keep Both — full review-screen gate '
-                  'lands in v0.14.',
-                );
               }
               session
                   .sendFrame(PhotoSkipListEnvelope(skip: skip).toBytes())
                   .catchError((Object _) {});
-              _skippedByCategory[DataCategory.photos] =
-                  (_skippedByCategory[DataCategory.photos] ?? 0) + skip.length;
               if (mounted) setState(() {});
               break;
             case PhotoSkipListEnvelope():
-              // Receiver-side, this should never arrive. Sender-side, the
-              // _streamPhotos local subscription consumes it; if we land
-              // here it's stray.
               break;
             case MediaStartEnvelope(:final header):
               activeMediaSha = header.sha256;
@@ -689,9 +496,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                 skippingActiveMedia = true;
               } else {
                 skippingActiveMedia = false;
-                // Open the receiver-side MediaStore stream. If insert
-                // fails (rare; e.g. storage full), fall back to skipping
-                // — the chunks still come in and just get discarded.
                 mediaReader
                     .writeStart(
                   sha256: header.sha256,
@@ -701,20 +505,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   takenAtMs: header.takenAtMs,
                 )
                     .then((opened) {
-                  if (!opened) {
-                    skippingActiveMedia = true;
-                  }
+                  if (!opened) skippingActiveMedia = true;
                 });
               }
               break;
-            case MediaChunkEnvelope(
-                  :final sha256,
-                  :final base64Bytes,
-                ):
-              if (sha256 != activeMediaSha) break;
-              if (skippingActiveMedia) break;
-              final bytes = base64.decode(base64Bytes);
-              mediaReader.writeChunk(sha256, bytes);
+            case MediaChunkEnvelope(:final sha256, :final base64Bytes):
+              if (sha256 != activeMediaSha || skippingActiveMedia) break;
+              mediaReader.writeChunk(sha256, base64.decode(base64Bytes));
               break;
             case MediaEndEnvelope(:final sha256):
               if (sha256 == activeMediaSha) {
@@ -722,19 +519,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   _skippedByCategory[DataCategory.photos] =
                       (_skippedByCategory[DataCategory.photos] ?? 0) + 1;
                 } else {
-                  // Close the stream + clear IS_PENDING. Once this resolves
-                  // the file is visible to the gallery.
                   mediaReader.writeEnd(sha256).then((ok) {
                     if (ok) {
                       _writtenByCategory[DataCategory.photos] =
                           (_writtenByCategory[DataCategory.photos] ?? 0) + 1;
-                      // Add to local dedup set so a re-streamed copy in
-                      // the same session doesn't double-write.
                       localMediaShas.add(sha256);
                     } else {
                       _skippedByCategory[DataCategory.photos] =
-                          (_skippedByCategory[DataCategory.photos] ?? 0) +
-                              1;
+                          (_skippedByCategory[DataCategory.photos] ?? 0) + 1;
                     }
                     if (mounted) setState(() {});
                   });
@@ -746,55 +538,17 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               }
               break;
             case CategoryDoneEnvelope(:final category):
-              switch (category) {
-                case DataCategory.sms:
-                  // SMS write is gated on becoming the default SMS app.
-                  // Keep the listener alive and handle the role-grab +
-                  // write asynchronously; the rest of the protocol
-                  // continues in parallel for other categories.
-                  _flushSmsBatchAsync(pendingSmsWrites);
-                  break;
-                case DataCategory.callLog:
-                  _flushBatch<CallLogRecord>(
-                    pending: pendingCallLogWrites,
-                    write: CallLogReader().writeAll,
-                    category: DataCategory.callLog,
-                  );
-                  break;
-                case DataCategory.contacts:
-                  _flushBatch<Contact>(
-                    pending: pendingContactWrites,
-                    write: ContactsReader().writeAll,
-                    category: DataCategory.contacts,
-                  );
-                  break;
-                case DataCategory.calendar:
-                  _flushBatch<CalendarEvent>(
-                    pending: pendingCalendarWrites,
-                    write: CalendarReader().writeAll,
-                    category: DataCategory.calendar,
-                  );
-                  break;
-                case DataCategory.photos:
-                  // No writer wired yet.
-                  break;
-              }
+              _phase[category] = _CategoryPhase.done;
+              if (mounted) setState(() {});
               break;
             case TransferDoneEnvelope():
               if (!completer.isCompleted) completer.complete();
               break;
             case ResumeEnvelope():
-              // Receiver-side: never receives Resume (it sends, not consumes).
-              // If we land here it's a stray frame — drop it.
               break;
             case HeartbeatEnvelope():
-              // Sender's keepalive tick during the photo pre-flight pass.
-              // No-op — we only need it to keep the TCP socket warm and
-              // signal "still working, hold on."
               break;
             case RecordAckEnvelope():
-              // The receiver emits these; the sender consumes them. If
-              // we land here it's a stray frame — drop it.
               break;
           }
         } catch (e) {
@@ -814,89 +568,131 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       },
     );
 
-    // Now that the listener is attached, tell the sender what we
-    // already have so it can skip ahead. Sending Resume earlier (or
-    // never sending it) was the source of the silent-hang regression
-    // — the broadcast stream behind incomingFrames() drops events
-    // arriving before any listener is attached.
+    // Tell sender we're ready.
     try {
-      await session.sendFrame(ResumeEnvelope(
-        watermarks: {
-          for (final e in wals.entries) e.key: e.value.watermark,
-        },
-      ).toBytes());
-    } catch (_) {/* sender will time out and start fresh */}
+      await session.sendFrame(ResumeEnvelope(watermarks: const {}).toBytes());
+    } catch (_) {}
 
+    // Wait for all data to arrive.
     await completer.future;
 
-    // Successful transfer — reset all per-category WALs so the next
-    // transfer starts fresh. Mid-transfer drops never reach here, so
-    // the next session reads non-zero watermarks and resumes.
-    for (final wal in wals.values) {
-      try {
-        await wal.reset();
-        await wal.close();
-      } catch (_) {}
+    // Step 4: Dedup and write (receiver only, post-transfer).
+    if (mounted) {
+      setState(() {
+        for (final c in manifest.categories) {
+          _phase[c] = _CategoryPhase.preparing;
+        }
+      });
     }
-  }
 
-  /// Flush the SMS batch via the default-SMS-app role grab dance:
-  /// 1) Confirm we still have at least one record to write — otherwise skip
-  ///    the role intrusion entirely.
-  /// 2) Request the role; the system shows a "Set as default SMS app"
-  ///    dialog. If the user denies, we mark all pending as skipped and
-  ///    move on (transfer continues for the other categories).
-  /// 3) Write the records via SmsReader.writeAll. The Done screen will
-  ///    surface the previous-default-package so the user knows which app
-  ///    to open to switch back.
-  Future<void> _flushSmsBatchAsync(List<SmsRecord> pending) async {
-    if (pending.isEmpty) return;
-    final batch = List<SmsRecord>.from(pending);
-    pending.clear();
-    final reader = SmsReader();
-    final previousDefault = await reader.getDefaultSmsPackage();
-    final granted =
-        await reader.isDefaultSmsApp() || await reader.requestSmsRole();
-    if (!granted) {
-      _skippedByCategory[DataCategory.sms] =
-          (_skippedByCategory[DataCategory.sms] ?? 0) + batch.length;
-      if (mounted) setState(() {});
-      return;
-    }
-    try {
-      final written = await reader.writeAll(batch);
-      _writtenByCategory[DataCategory.sms] =
-          (_writtenByCategory[DataCategory.sms] ?? 0) + written;
-      // Stash the previous default so the Done screen can tell the user
-      // which app to open to take the role back.
-      if (mounted && previousDefault != null) {
-        ref
-            .read(transferStateProvider.notifier)
-            .setPreviousSmsAppPackage(previousDefault);
+    // Build dedup indexes from local data.
+    final smsIndex = manifest.categories.contains(DataCategory.sms)
+        ? SmsDedup.indexOf(await SmsReader().readAll())
+        : <SmsDedupKey>{};
+    final callLogIndex = manifest.categories.contains(DataCategory.callLog)
+        ? CallLogDedup.indexOf(await CallLogReader().readAll())
+        : <CallLogDedupKey>{};
+    final contactsKeys = manifest.categories.contains(DataCategory.contacts)
+        ? <Set<String>>[
+            for (final c in await ContactsReader().readAll())
+              ContactsDedup.matchKeysFor(c),
+          ]
+        : <Set<String>>[];
+    final calendarIndex = manifest.categories.contains(DataCategory.calendar)
+        ? CalendarDedup.indexOf(await CalendarReader().readAll())
+        : <CalendarDedupKey>{};
+
+    // Dedup and write SMS.
+    if (incomingSms.isNotEmpty) {
+      final toWrite = <SmsRecord>[];
+      for (final r in incomingSms) {
+        if (SmsDedup.isDuplicate(smsIndex, r)) {
+          _skippedByCategory[DataCategory.sms] =
+              (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
+        } else {
+          toWrite.add(r);
+        }
       }
-    } catch (_) {
-      // If the write fails wholesale, treat the batch as skipped.
-      _skippedByCategory[DataCategory.sms] =
-          (_skippedByCategory[DataCategory.sms] ?? 0) + batch.length;
-    }
-    if (mounted) setState(() {});
-  }
-
-  // -------------------------------------------------------- Per-cat flush
-
-  void _flushBatch<T>({
-    required List<T> pending,
-    required Future<int> Function(List<T>) write,
-    required DataCategory category,
-  }) {
-    if (pending.isEmpty) return;
-    final batch = List<T>.from(pending);
-    pending.clear();
-    write(batch).then((written) {
-      _writtenByCategory[category] =
-          (_writtenByCategory[category] ?? 0) + written;
+      if (toWrite.isNotEmpty) {
+        final reader = SmsReader();
+        final granted =
+            await reader.isDefaultSmsApp() || await reader.requestSmsRole();
+        if (granted) {
+          final written = await reader.writeAll(toWrite);
+          _writtenByCategory[DataCategory.sms] =
+              (_writtenByCategory[DataCategory.sms] ?? 0) + written;
+        } else {
+          _skippedByCategory[DataCategory.sms] =
+              (_skippedByCategory[DataCategory.sms] ?? 0) + toWrite.length;
+        }
+      }
+      _phase[DataCategory.sms] = _CategoryPhase.done;
       if (mounted) setState(() {});
-    });
+    }
+
+    // Dedup and write call log.
+    if (incomingCallLog.isNotEmpty) {
+      final toWrite = <CallLogRecord>[];
+      for (final r in incomingCallLog) {
+        if (CallLogDedup.isDuplicate(callLogIndex, r)) {
+          _skippedByCategory[DataCategory.callLog] =
+              (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
+        } else {
+          toWrite.add(r);
+        }
+      }
+      if (toWrite.isNotEmpty) {
+        final written = await CallLogReader().writeAll(toWrite);
+        _writtenByCategory[DataCategory.callLog] =
+            (_writtenByCategory[DataCategory.callLog] ?? 0) + written;
+      }
+      _phase[DataCategory.callLog] = _CategoryPhase.done;
+      if (mounted) setState(() {});
+    }
+
+    // Dedup and write contacts.
+    if (incomingContacts.isNotEmpty) {
+      final toWrite = <Contact>[];
+      for (final r in incomingContacts) {
+        final keys = ContactsDedup.matchKeysFor(r);
+        final isDup = keys.isNotEmpty &&
+            contactsKeys
+                .any((existing) => existing.intersection(keys).length == keys.length);
+        if (isDup) {
+          _skippedByCategory[DataCategory.contacts] =
+              (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
+        } else {
+          toWrite.add(r);
+        }
+      }
+      if (toWrite.isNotEmpty) {
+        final written = await ContactsReader().writeAll(toWrite);
+        _writtenByCategory[DataCategory.contacts] =
+            (_writtenByCategory[DataCategory.contacts] ?? 0) + written;
+      }
+      _phase[DataCategory.contacts] = _CategoryPhase.done;
+      if (mounted) setState(() {});
+    }
+
+    // Dedup and write calendar.
+    if (incomingCalendar.isNotEmpty) {
+      final toWrite = <CalendarEvent>[];
+      for (final r in incomingCalendar) {
+        if (CalendarDedup.isDuplicate(calendarIndex, r)) {
+          _skippedByCategory[DataCategory.calendar] =
+              (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
+        } else {
+          toWrite.add(r);
+        }
+      }
+      if (toWrite.isNotEmpty) {
+        final written = await CalendarReader().writeAll(toWrite);
+        _writtenByCategory[DataCategory.calendar] =
+            (_writtenByCategory[DataCategory.calendar] ?? 0) + written;
+      }
+      _phase[DataCategory.calendar] = _CategoryPhase.done;
+      if (mounted) setState(() {});
+    }
   }
 
   // ----------------------------------------------------------------- Render
@@ -1036,9 +832,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
   Widget _categoryRow(TransferManifest manifest, DataCategory c) {
     final total = manifest.counts[c] ?? 0;
-    final done = _processed[c] ?? 0;
     final role = ref.read(transferStateProvider).role;
     final isReceiver = role == DeviceRole.receiver;
+    // Sender shows _sent (what it transmitted); receiver shows _processed.
+    final done = isReceiver ? (_processed[c] ?? 0) : (_sent[c] ?? 0);
     final phase = _phase[c] ??
         (isReceiver
             // Receiver: derived from progress vs total because the
