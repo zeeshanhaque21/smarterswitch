@@ -72,11 +72,16 @@ class TransferScreen extends ConsumerStatefulWidget {
 
 class _TransferScreenState extends ConsumerState<TransferScreen> {
   /// Per-category running tally of items *processed* on this side. On the
-  /// sender, "processed" = sent. On the receiver, "processed" = received +
-  /// dedup-decided + (if new) written.
+  /// sender, "processed" = confirmed by the receiver's ack. On the receiver,
+  /// "processed" = received + dedup-decided + (if new) written.
   final Map<DataCategory, int> _processed = {};
   final Map<DataCategory, int> _writtenByCategory = {};
   final Map<DataCategory, int> _skippedByCategory = {};
+
+  /// Per-category count of records the sender has transmitted. The sender
+  /// waits until _processed[c] (from receiver acks) reaches _sent[c] before
+  /// marking the category done, keeping both progress bars in sync.
+  final Map<DataCategory, int> _sent = {};
 
   /// Per-category lifecycle state — what phase each row is in. Drives the
   /// status label and color in the per-row UI so the user can see at a
@@ -263,9 +268,17 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         final records = await reader();
         _phase[category] = _CategoryPhase.streaming;
         if (mounted) setState(() {});
+        var sentCount = n; // Already-acked from resume
         for (var i = 0; i < records.length; i++) {
           if (i < n) continue;
           await session.sendFrame(encode(records[i]));
+          sentCount++;
+          _sent[category] = sentCount;
+        }
+        // Wait for receiver to ack all sent records before proceeding.
+        // This keeps both progress bars synchronized.
+        while ((_processed[category] ?? 0) < sentCount) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
         }
       }
 
