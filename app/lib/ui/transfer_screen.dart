@@ -197,7 +197,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           'Review screen, then try again.',
         );
       }
-      if (mounted) setState(() => _flowState = 'Resume received, sending');
+      if (mounted) setState(() => _flowState = 'Resume received, sending Ready');
+
+      // Tell receiver we're about to start sending
+      await session.sendFrame(const ReadyEnvelope().toBytes());
 
       for (final c in manifest.categories) {
         _phase[c] = _CategoryPhase.queued;
@@ -450,6 +453,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     bool skippingActiveMedia = false;
 
     final completer = Completer<void>();
+    final readyCompleter = Completer<void>();
     if (mounted) setState(() => _flowState = 'attaching listener');
 
     // Step 2: Attach listener and tell sender we're ready.
@@ -559,6 +563,9 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               break;
             case HeartbeatEnvelope():
               break;
+            case ReadyEnvelope():
+              if (!readyCompleter.isCompleted) readyCompleter.complete();
+              break;
             case RecordAckEnvelope():
               break;
           }
@@ -584,6 +591,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     try {
       await session.sendFrame(ResumeEnvelope(watermarks: const {}).toBytes());
     } catch (_) {}
+
+    // Wait for sender's Ready acknowledgment (handled in main listener).
+    if (mounted) setState(() => _flowState = 'waiting for Ready');
+    await readyCompleter.future.timeout(const Duration(seconds: 30)).catchError((_) {});
 
     // Wait for all data to arrive.
     if (mounted) setState(() => _flowState = 'waiting for data');

@@ -150,6 +150,8 @@ sealed class TransferEnvelope {
         );
       case 'heartbeat':
         return const HeartbeatEnvelope();
+      case 'ready':
+        return const ReadyEnvelope();
       case 'resume':
         return ResumeEnvelope(
           watermarks: {
@@ -359,6 +361,16 @@ class HeartbeatEnvelope extends TransferEnvelope {
   @override
   Uint8List toBytes() =>
       Uint8List.fromList(utf8.encode(jsonEncode({'kind': 'heartbeat'})));
+}
+
+/// Sender → receiver, sent after receiving Resume to confirm the sender
+/// is about to start streaming. Receiver waits for this before entering
+/// the main data-receiving loop, ensuring no frames are missed.
+class ReadyEnvelope extends TransferEnvelope {
+  const ReadyEnvelope();
+  @override
+  Uint8List toBytes() =>
+      Uint8List.fromList(utf8.encode(jsonEncode({'kind': 'ready'})));
 }
 
 /// Receiver → sender, sent at the start of each transfer session.
