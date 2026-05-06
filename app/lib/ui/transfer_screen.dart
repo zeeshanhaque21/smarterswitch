@@ -165,6 +165,9 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     }
   }
 
+  /// Incoming envelopes from receiver (batch acks, category acks, etc.)
+  final _receiverAcks = <TransferEnvelope>[];
+
   Future<void> _runAsSender(
     PairedSession session,
     TransferManifest manifest,
@@ -178,6 +181,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       try {
         final env = TransferEnvelope.fromBytes(frame);
         _lastFrameKind = env.runtimeType.toString();
+        _receiverAcks.add(env);
         if (env is ResumeEnvelope && !resumeCompleter.isCompleted) {
           resumeCompleter.complete();
         }
@@ -214,53 +218,116 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     }
   }
 
+  /// Wait for a specific envelope type from the receiver, with timeout.
+  Future<T> _waitForEnvelope<T extends TransferEnvelope>({
+    Duration timeout = const Duration(seconds: 60),
+    bool Function(T)? where,
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      // Check already-received acks
+      for (var i = 0; i < _receiverAcks.length; i++) {
+        final env = _receiverAcks[i];
+        if (env is T && (where == null || where(env))) {
+          _receiverAcks.removeAt(i);
+          return env;
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    throw TimeoutException('Timed out waiting for ${T.toString()}', timeout);
+  }
+
+  /// Process any incoming ItemBatchAck envelopes to update progress.
+  void _processIncomingAcks(DataCategory category) {
+    _receiverAcks.removeWhere((env) {
+      if (env is ItemBatchAckEnvelope && env.category == category) {
+        _processed[category] =
+            (_processed[category] ?? 0) + env.receivedIds.length;
+        if (mounted) setState(() {});
+        return true;
+      }
+      return false;
+    });
+  }
+
   Future<void> _runSenderInner(
     PairedSession session,
     TransferManifest manifest,
   ) async {
     for (final category in manifest.categories) {
       _phase[category] = _CategoryPhase.preparing;
-      if (mounted) setState(() {});
+      if (mounted) setState(() => _flowState = 'preparing $category');
 
-      Future<void> streamFromList<T>(
+      final count = manifest.counts[category] ?? 0;
+
+      // 1. Announce category
+      await session.sendFrame(CategoryAnnounceEnvelope(
+        category: category,
+        itemCount: count,
+      ).toBytes());
+      if (mounted) setState(() => _flowState = 'waiting for ack: $category');
+
+      // 2. Wait for receiver's ack
+      await _waitForEnvelope<CategoryAckEnvelope>(
+        timeout: const Duration(seconds: 30),
+        where: (ack) => ack.category == category,
+      );
+      if (mounted) setState(() => _flowState = 'streaming $category');
+
+      // 3. Stream records, tracking IDs
+      final sentIds = <String>[];
+
+      Future<void> streamWithIds<T>(
         Future<List<T>> Function() reader,
         Uint8List Function(T) encode,
+        String Function(T) computeId,
       ) async {
         final records = await reader();
         _phase[category] = _CategoryPhase.streaming;
         if (mounted) setState(() {});
         for (var i = 0; i < records.length; i++) {
-          await session.sendFrame(encode(records[i]));
+          final r = records[i];
+          final id = computeId(r);
+          sentIds.add(id);
+          await session.sendFrame(encode(r));
           _sent[category] = i + 1;
+
+          // Process any incoming batch acks to update progress
+          _processIncomingAcks(category);
           if (mounted) setState(() {});
         }
       }
 
       switch (category) {
         case DataCategory.sms:
-          await streamFromList<SmsRecord>(
+          await streamWithIds<SmsRecord>(
             () => SmsReader().readAll(),
             (r) => SmsRecordEnvelope(r).toBytes(),
+            (r) => SmsDedup.keyFor(r).toString(),
           );
           break;
         case DataCategory.callLog:
-          await streamFromList<CallLogRecord>(
+          await streamWithIds<CallLogRecord>(
             () => CallLogReader().readAll(),
             (r) => CallLogRecordEnvelope(r).toBytes(),
+            (r) => CallLogDedup.keyFor(r).toString(),
           );
           break;
         case DataCategory.contacts:
-          await streamFromList<Contact>(
+          await streamWithIds<Contact>(
             () async => (await ContactsReader().readAll())
                 .where((c) => !c.isGoogleSynced)
                 .toList(growable: false),
             (r) => ContactRecordEnvelope(r).toBytes(),
+            (r) => ContactsDedup.matchKeysFor(r).join('|'),
           );
           break;
         case DataCategory.calendar:
-          await streamFromList<CalendarEvent>(
+          await streamWithIds<CalendarEvent>(
             () => CalendarReader().readAll(),
             (r) => CalendarEventEnvelope(r).toBytes(),
+            (r) => CalendarDedup.keyFor(r).toString(),
           );
           break;
         case DataCategory.photos:
@@ -270,10 +337,26 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           });
           break;
       }
+
+      // 4. Send CategorySent with all IDs
+      if (mounted) setState(() => _flowState = 'waiting for $category confirm');
+      await session.sendFrame(CategorySentEnvelope(
+        category: category,
+        itemIds: sentIds,
+      ).toBytes());
+
+      // 5. Wait for CategoryReceived confirmation
+      final received = await _waitForEnvelope<CategoryReceivedEnvelope>(
+        timeout: const Duration(seconds: 60),
+        where: (r) => r.category == category,
+      );
+
+      // Update final count from receiver's confirmation
+      _processed[category] = received.receivedCount;
       _phase[category] = _CategoryPhase.done;
       if (mounted) setState(() {});
-      await session.sendFrame(CategoryDoneEnvelope(category).toBytes());
     }
+
     await session.sendFrame(const TransferDoneEnvelope().toBytes());
   }
 
@@ -422,6 +505,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     }
   }
 
+  /// Pending dedup/write futures for parallel processing.
+  final _pendingDedupFutures = <Future<void>>[];
+
+  /// Per-category buffer of incoming records and their IDs.
+  final _receivedIds = <DataCategory, List<String>>{};
+
   Future<void> _runAsReceiver(
     PairedSession session,
     TransferManifest manifest,
@@ -440,11 +529,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     if (mounted) setState(() => _flowState = 'perms done');
 
     // Buffers to collect all incoming records during transfer.
-    // Dedup and write happen AFTER TransferDoneEnvelope.
     final incomingSms = <SmsRecord>[];
     final incomingCallLog = <CallLogRecord>[];
     final incomingContacts = <Contact>[];
     final incomingCalendar = <CalendarEvent>[];
+
+    // Track current category being received (used for debugging)
+    // ignore: unused_local_variable
+    DataCategory? activeCategory;
 
     // Photos still use streaming write (too large to buffer).
     final mediaReader = MediaReader();
@@ -456,9 +548,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final readyCompleter = Completer<void>();
     if (mounted) setState(() => _flowState = 'attaching listener');
 
+    // Batch ack counter
+    const batchSize = 25;
+
     // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
-      (frame) {
+      (frame) async {
         _framesSeen += 1;
         try {
           final env = TransferEnvelope.fromBytes(frame);
@@ -466,31 +561,110 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           switch (env) {
             case ManifestEnvelope():
               break;
-            // Step 3: Buffer all incoming records (no dedup yet).
+
+            // New protocol: CategoryAnnounce starts a category
+            case CategoryAnnounceEnvelope(:final category, :final itemCount):
+              activeCategory = category;
+              _receivedIds[category] = [];
+              _phase[category] = _CategoryPhase.streaming;
+              if (mounted) setState(() => _flowState = 'receiving $category ($itemCount items)');
+              // Ack the category
+              await session.sendFrame(CategoryAckEnvelope(category: category).toBytes());
+              break;
+
+            // Buffer records with ID tracking
             case SmsRecordEnvelope(:final record):
               incomingSms.add(record);
+              final id = SmsDedup.keyFor(record).toString();
+              _receivedIds[DataCategory.sms]?.add(id);
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
+              // Send batch ack every N records
+              if ((_receivedIds[DataCategory.sms]?.length ?? 0) % batchSize == 0) {
+                final ids = _receivedIds[DataCategory.sms]!;
+                await session.sendFrame(ItemBatchAckEnvelope(
+                  category: DataCategory.sms,
+                  receivedIds: ids.sublist(ids.length - batchSize),
+                ).toBytes());
+              }
               if (mounted) setState(() {});
               break;
+
             case CallLogRecordEnvelope(:final record):
               incomingCallLog.add(record);
+              final id = CallLogDedup.keyFor(record).toString();
+              _receivedIds[DataCategory.callLog]?.add(id);
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
+              if ((_receivedIds[DataCategory.callLog]?.length ?? 0) % batchSize == 0) {
+                final ids = _receivedIds[DataCategory.callLog]!;
+                await session.sendFrame(ItemBatchAckEnvelope(
+                  category: DataCategory.callLog,
+                  receivedIds: ids.sublist(ids.length - batchSize),
+                ).toBytes());
+              }
               if (mounted) setState(() {});
               break;
+
             case ContactRecordEnvelope(:final record):
               incomingContacts.add(record);
+              final id = ContactsDedup.matchKeysFor(record).join('|');
+              _receivedIds[DataCategory.contacts]?.add(id);
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
+              if ((_receivedIds[DataCategory.contacts]?.length ?? 0) % batchSize == 0) {
+                final ids = _receivedIds[DataCategory.contacts]!;
+                await session.sendFrame(ItemBatchAckEnvelope(
+                  category: DataCategory.contacts,
+                  receivedIds: ids.sublist(ids.length - batchSize),
+                ).toBytes());
+              }
               if (mounted) setState(() {});
               break;
+
             case CalendarEventEnvelope(:final record):
               incomingCalendar.add(record);
+              final id = CalendarDedup.keyFor(record).toString();
+              _receivedIds[DataCategory.calendar]?.add(id);
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
+              if ((_receivedIds[DataCategory.calendar]?.length ?? 0) % batchSize == 0) {
+                final ids = _receivedIds[DataCategory.calendar]!;
+                await session.sendFrame(ItemBatchAckEnvelope(
+                  category: DataCategory.calendar,
+                  receivedIds: ids.sublist(ids.length - batchSize),
+                ).toBytes());
+              }
               if (mounted) setState(() {});
               break;
+
+            // New protocol: CategorySent ends a category
+            case CategorySentEnvelope(:final category, :final itemIds):
+              final received = _receivedIds[category] ?? [];
+              final missing = itemIds.where((id) => !received.contains(id)).toList();
+              // Send confirmation
+              await session.sendFrame(CategoryReceivedEnvelope(
+                category: category,
+                receivedCount: received.length,
+                missingIds: missing,
+              ).toBytes());
+              _phase[category] = _CategoryPhase.done;
+              if (mounted) setState(() => _flowState = '$category done, deduping in background');
+              // Start background dedup/write for this category
+              _pendingDedupFutures.add(_dedupAndWriteCategory(
+                category,
+                incomingSms: List.of(incomingSms),
+                incomingCallLog: List.of(incomingCallLog),
+                incomingContacts: List.of(incomingContacts),
+                incomingCalendar: List.of(incomingCalendar),
+              ));
+              // Clear buffers for next category
+              if (category == DataCategory.sms) incomingSms.clear();
+              if (category == DataCategory.callLog) incomingCallLog.clear();
+              if (category == DataCategory.contacts) incomingContacts.clear();
+              if (category == DataCategory.calendar) incomingCalendar.clear();
+              break;
+
             case PhotoHashesEnvelope(:final entries):
               final skip = <String>[];
               for (final e in entries) {
@@ -552,10 +726,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                 if (mounted) setState(() {});
               }
               break;
+
+            // Legacy envelope (keep for back-compat)
             case CategoryDoneEnvelope(:final category):
               _phase[category] = _CategoryPhase.done;
               if (mounted) setState(() {});
               break;
+
             case TransferDoneEnvelope():
               if (!completer.isCompleted) completer.complete();
               break;
@@ -567,6 +744,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               if (!readyCompleter.isCompleted) readyCompleter.complete();
               break;
             case RecordAckEnvelope():
+              break;
+            case CategoryAckEnvelope():
+              break;
+            case CategoryReceivedEnvelope():
+              break;
+            case ItemBatchAckEnvelope():
               break;
           }
         } catch (e) {
@@ -601,122 +784,119 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     await completer.future;
     if (mounted) setState(() => _flowState = 'data received');
 
-    // Step 4: Dedup and write (receiver only, post-transfer).
-    if (mounted) {
-      setState(() {
-        for (final c in manifest.categories) {
-          _phase[c] = _CategoryPhase.preparing;
-        }
-      });
-    }
+    // Wait for all background dedup tasks to complete
+    if (mounted) setState(() => _flowState = 'finalizing writes');
+    await Future.wait(_pendingDedupFutures);
+    if (mounted) setState(() => _flowState = 'all done');
+  }
 
-    // Build dedup indexes from local data.
-    final smsIndex = manifest.categories.contains(DataCategory.sms)
-        ? SmsDedup.indexOf(await SmsReader().readAll())
-        : <SmsDedupKey>{};
-    final callLogIndex = manifest.categories.contains(DataCategory.callLog)
-        ? CallLogDedup.indexOf(await CallLogReader().readAll())
-        : <CallLogDedupKey>{};
-    final contactsKeys = manifest.categories.contains(DataCategory.contacts)
-        ? <Set<String>>[
-            for (final c in await ContactsReader().readAll())
-              ContactsDedup.matchKeysFor(c),
-          ]
-        : <Set<String>>[];
-    final calendarIndex = manifest.categories.contains(DataCategory.calendar)
-        ? CalendarDedup.indexOf(await CalendarReader().readAll())
-        : <CalendarDedupKey>{};
+  /// Background dedup and write for a single category.
+  Future<void> _dedupAndWriteCategory(
+    DataCategory category, {
+    required List<SmsRecord> incomingSms,
+    required List<CallLogRecord> incomingCallLog,
+    required List<Contact> incomingContacts,
+    required List<CalendarEvent> incomingCalendar,
+  }) async {
+    switch (category) {
+      case DataCategory.sms:
+        if (incomingSms.isEmpty) return;
+        final smsIndex = SmsDedup.indexOf(await SmsReader().readAll());
+        final toWrite = <SmsRecord>[];
+        for (final r in incomingSms) {
+          if (SmsDedup.isDuplicate(smsIndex, r)) {
+            _skippedByCategory[DataCategory.sms] =
+                (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
+          } else {
+            toWrite.add(r);
+          }
+        }
+        if (toWrite.isNotEmpty) {
+          final reader = SmsReader();
+          final granted =
+              await reader.isDefaultSmsApp() || await reader.requestSmsRole();
+          if (granted) {
+            final written = await reader.writeAll(toWrite);
+            _writtenByCategory[DataCategory.sms] =
+                (_writtenByCategory[DataCategory.sms] ?? 0) + written;
+          } else {
+            _skippedByCategory[DataCategory.sms] =
+                (_skippedByCategory[DataCategory.sms] ?? 0) + toWrite.length;
+          }
+        }
+        if (mounted) setState(() {});
+        break;
 
-    // Dedup and write SMS.
-    if (incomingSms.isNotEmpty) {
-      final toWrite = <SmsRecord>[];
-      for (final r in incomingSms) {
-        if (SmsDedup.isDuplicate(smsIndex, r)) {
-          _skippedByCategory[DataCategory.sms] =
-              (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
-        } else {
-          toWrite.add(r);
+      case DataCategory.callLog:
+        if (incomingCallLog.isEmpty) return;
+        final callLogIndex = CallLogDedup.indexOf(await CallLogReader().readAll());
+        final toWrite = <CallLogRecord>[];
+        for (final r in incomingCallLog) {
+          if (CallLogDedup.isDuplicate(callLogIndex, r)) {
+            _skippedByCategory[DataCategory.callLog] =
+                (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
+          } else {
+            toWrite.add(r);
+          }
         }
-      }
-      if (toWrite.isNotEmpty) {
-        final reader = SmsReader();
-        final granted =
-            await reader.isDefaultSmsApp() || await reader.requestSmsRole();
-        if (granted) {
-          final written = await reader.writeAll(toWrite);
-          _writtenByCategory[DataCategory.sms] =
-              (_writtenByCategory[DataCategory.sms] ?? 0) + written;
-        } else {
-          _skippedByCategory[DataCategory.sms] =
-              (_skippedByCategory[DataCategory.sms] ?? 0) + toWrite.length;
+        if (toWrite.isNotEmpty) {
+          final written = await CallLogReader().writeAll(toWrite);
+          _writtenByCategory[DataCategory.callLog] =
+              (_writtenByCategory[DataCategory.callLog] ?? 0) + written;
         }
-      }
-      _phase[DataCategory.sms] = _CategoryPhase.done;
-      if (mounted) setState(() {});
-    }
+        if (mounted) setState(() {});
+        break;
 
-    // Dedup and write call log.
-    if (incomingCallLog.isNotEmpty) {
-      final toWrite = <CallLogRecord>[];
-      for (final r in incomingCallLog) {
-        if (CallLogDedup.isDuplicate(callLogIndex, r)) {
-          _skippedByCategory[DataCategory.callLog] =
-              (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
-        } else {
-          toWrite.add(r);
+      case DataCategory.contacts:
+        if (incomingContacts.isEmpty) return;
+        final contactsKeys = <Set<String>>[
+          for (final c in await ContactsReader().readAll())
+            ContactsDedup.matchKeysFor(c),
+        ];
+        final toWrite = <Contact>[];
+        for (final r in incomingContacts) {
+          final keys = ContactsDedup.matchKeysFor(r);
+          final isDup = keys.isNotEmpty &&
+              contactsKeys.any(
+                  (existing) => existing.intersection(keys).length == keys.length);
+          if (isDup) {
+            _skippedByCategory[DataCategory.contacts] =
+                (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
+          } else {
+            toWrite.add(r);
+          }
         }
-      }
-      if (toWrite.isNotEmpty) {
-        final written = await CallLogReader().writeAll(toWrite);
-        _writtenByCategory[DataCategory.callLog] =
-            (_writtenByCategory[DataCategory.callLog] ?? 0) + written;
-      }
-      _phase[DataCategory.callLog] = _CategoryPhase.done;
-      if (mounted) setState(() {});
-    }
+        if (toWrite.isNotEmpty) {
+          final written = await ContactsReader().writeAll(toWrite);
+          _writtenByCategory[DataCategory.contacts] =
+              (_writtenByCategory[DataCategory.contacts] ?? 0) + written;
+        }
+        if (mounted) setState(() {});
+        break;
 
-    // Dedup and write contacts.
-    if (incomingContacts.isNotEmpty) {
-      final toWrite = <Contact>[];
-      for (final r in incomingContacts) {
-        final keys = ContactsDedup.matchKeysFor(r);
-        final isDup = keys.isNotEmpty &&
-            contactsKeys
-                .any((existing) => existing.intersection(keys).length == keys.length);
-        if (isDup) {
-          _skippedByCategory[DataCategory.contacts] =
-              (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
-        } else {
-          toWrite.add(r);
+      case DataCategory.calendar:
+        if (incomingCalendar.isEmpty) return;
+        final calendarIndex = CalendarDedup.indexOf(await CalendarReader().readAll());
+        final toWrite = <CalendarEvent>[];
+        for (final r in incomingCalendar) {
+          if (CalendarDedup.isDuplicate(calendarIndex, r)) {
+            _skippedByCategory[DataCategory.calendar] =
+                (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
+          } else {
+            toWrite.add(r);
+          }
         }
-      }
-      if (toWrite.isNotEmpty) {
-        final written = await ContactsReader().writeAll(toWrite);
-        _writtenByCategory[DataCategory.contacts] =
-            (_writtenByCategory[DataCategory.contacts] ?? 0) + written;
-      }
-      _phase[DataCategory.contacts] = _CategoryPhase.done;
-      if (mounted) setState(() {});
-    }
+        if (toWrite.isNotEmpty) {
+          final written = await CalendarReader().writeAll(toWrite);
+          _writtenByCategory[DataCategory.calendar] =
+              (_writtenByCategory[DataCategory.calendar] ?? 0) + written;
+        }
+        if (mounted) setState(() {});
+        break;
 
-    // Dedup and write calendar.
-    if (incomingCalendar.isNotEmpty) {
-      final toWrite = <CalendarEvent>[];
-      for (final r in incomingCalendar) {
-        if (CalendarDedup.isDuplicate(calendarIndex, r)) {
-          _skippedByCategory[DataCategory.calendar] =
-              (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
-        } else {
-          toWrite.add(r);
-        }
-      }
-      if (toWrite.isNotEmpty) {
-        final written = await CalendarReader().writeAll(toWrite);
-        _writtenByCategory[DataCategory.calendar] =
-            (_writtenByCategory[DataCategory.calendar] ?? 0) + written;
-      }
-      _phase[DataCategory.calendar] = _CategoryPhase.done;
-      if (mounted) setState(() {});
+      case DataCategory.photos:
+        // Photos use streaming write, handled inline
+        break;
     }
   }
 
@@ -767,6 +947,21 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // Diagnostic strip at top so it's always visible
+            Container(
+              padding: const EdgeInsets.all(8),
+              color: Colors.grey.shade200,
+              child: DefaultTextStyle.merge(
+                style: const TextStyle(fontSize: 11, color: Colors.black87),
+                child: Column(
+                  children: [
+                    Text('state: $_flowState | frames: $_framesSeen'),
+                    Text('last: $_lastFrameKind${_frameError != null ? " | err: $_frameError" : ""}'),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
             if (_isHashingPhase(state)) _hashingBanner(),
             const SizedBox(height: 8),
             for (final c in manifest.categories) _categoryRow(manifest, c),
@@ -778,41 +973,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                 child: Text('Working…',
                     style: TextStyle(fontStyle: FontStyle.italic)),
               ),
-            const SizedBox(height: 12),
-            // Diagnostic strip: lets the user see whether frames are
-            // actually arriving on this device. If "frames" stays at 0
-            // while the other phone reports sending, the issue is
-            // delivery (the broadcast stream had no listener at the
-            // moment events fired). If frames are climbing but
-            // _processed isn't, the issue is downstream of the
-            // listener (parse, dedup, write). Removable once the
-            // protocol is stable.
-            DefaultTextStyle.merge(
-              style: const TextStyle(fontSize: 11, color: Colors.black54),
-              child: Column(
-                children: [
-                  Text('state: $_flowState'),
-                  const SizedBox(height: 4),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text('frames: $_framesSeen'),
-                      const SizedBox(width: 12),
-                      Text('last: $_lastFrameKind'),
-                      if (_frameError != null) ...[
-                        const SizedBox(width: 12),
-                        Flexible(
-                          child: Text(
-                            'err: $_frameError',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ],
-              ),
-            ),
           ],
         ),
       ),

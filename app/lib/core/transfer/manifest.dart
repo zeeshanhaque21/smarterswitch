@@ -152,6 +152,47 @@ sealed class TransferEnvelope {
         return const HeartbeatEnvelope();
       case 'ready':
         return const ReadyEnvelope();
+      case 'category_announce':
+        return CategoryAnnounceEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+          ),
+          itemCount: (raw['itemCount'] as num?)?.toInt() ?? 0,
+        );
+      case 'category_ack':
+        return CategoryAckEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+          ),
+        );
+      case 'category_sent':
+        return CategorySentEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+          ),
+          itemIds: ((raw['itemIds'] as List<dynamic>?) ?? const [])
+              .cast<String>()
+              .toList(growable: false),
+        );
+      case 'category_received':
+        return CategoryReceivedEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+          ),
+          receivedCount: (raw['receivedCount'] as num?)?.toInt() ?? 0,
+          missingIds: ((raw['missingIds'] as List<dynamic>?) ?? const [])
+              .cast<String>()
+              .toList(growable: false),
+        );
+      case 'item_batch_ack':
+        return ItemBatchAckEnvelope(
+          category: DataCategory.values.firstWhere(
+            (c) => c.name == raw['category'],
+          ),
+          receivedIds: ((raw['receivedIds'] as List<dynamic>?) ?? const [])
+              .cast<String>()
+              .toList(growable: false),
+        );
       case 'resume':
         return ResumeEnvelope(
           watermarks: {
@@ -426,6 +467,88 @@ class RecordAckEnvelope extends TransferEnvelope {
         'kind': 'record_ack',
         'category': category.name,
         'count': count,
+      })));
+}
+
+/// Sender → receiver: announces that category X with N items is about to start.
+/// Receiver must ack before sender streams records.
+class CategoryAnnounceEnvelope extends TransferEnvelope {
+  const CategoryAnnounceEnvelope({
+    required this.category,
+    required this.itemCount,
+  });
+  final DataCategory category;
+  final int itemCount;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'category_announce',
+        'category': category.name,
+        'itemCount': itemCount,
+      })));
+}
+
+/// Receiver → sender: confirms ready to receive category X.
+class CategoryAckEnvelope extends TransferEnvelope {
+  const CategoryAckEnvelope({required this.category});
+  final DataCategory category;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'category_ack',
+        'category': category.name,
+      })));
+}
+
+/// Sender → receiver: all items for category X have been sent. Includes
+/// all item IDs so receiver can verify it got everything.
+class CategorySentEnvelope extends TransferEnvelope {
+  const CategorySentEnvelope({
+    required this.category,
+    required this.itemIds,
+  });
+  final DataCategory category;
+  final List<String> itemIds;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'category_sent',
+        'category': category.name,
+        'itemIds': itemIds,
+      })));
+}
+
+/// Receiver → sender: confirms all items for category X were received.
+/// [missingIds] lists any IDs the receiver didn't get (for future retry).
+class CategoryReceivedEnvelope extends TransferEnvelope {
+  const CategoryReceivedEnvelope({
+    required this.category,
+    required this.receivedCount,
+    required this.missingIds,
+  });
+  final DataCategory category;
+  final int receivedCount;
+  final List<String> missingIds;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'category_received',
+        'category': category.name,
+        'receivedCount': receivedCount,
+        'missingIds': missingIds,
+      })));
+}
+
+/// Receiver → sender: periodic batch ack of received item IDs. Sent every
+/// N records so sender can update progress without waiting for category end.
+class ItemBatchAckEnvelope extends TransferEnvelope {
+  const ItemBatchAckEnvelope({
+    required this.category,
+    required this.receivedIds,
+  });
+  final DataCategory category;
+  final List<String> receivedIds;
+  @override
+  Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
+        'kind': 'item_batch_ack',
+        'category': category.name,
+        'receivedIds': receivedIds,
       })));
 }
 
