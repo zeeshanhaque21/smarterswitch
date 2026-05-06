@@ -97,6 +97,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   /// understands why the byte total is less than what they have.
   int _photosSkippedPreflight = 0;
 
+  /// Diagnostics: total frames seen by this device's incoming listener,
+  /// last envelope kind decoded, and last error from the listener.
+  /// Surfaced on-screen so a user can tell at a glance whether frames
+  /// are even reaching this phone.
+  int _framesSeen = 0;
+  String _lastFrameKind = '—';
+  String? _frameError;
+
   @override
   void initState() {
     super.initState();
@@ -161,8 +169,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     // RecordAck flow back from the receiver to drive progress.
     final resumeCompleter = Completer<Map<DataCategory, int>>();
     final sub = session.incomingFrames().listen((frame) {
+      _framesSeen += 1;
       try {
         final env = TransferEnvelope.fromBytes(frame);
+        _lastFrameKind = env.runtimeType.toString();
         switch (env) {
           case ResumeEnvelope(:final watermarks):
             if (!resumeCompleter.isCompleted) {
@@ -181,7 +191,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             // sender pass — ignore.
             break;
         }
-      } catch (_) {/* malformed frame; drop */}
+      } catch (e) {
+        _frameError = e.toString();
+      }
+      if (mounted) setState(() {});
     });
 
     try {
@@ -552,8 +565,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
     _incomingSub = session.incomingFrames().listen(
       (frame) {
+        _framesSeen += 1;
         try {
           final env = TransferEnvelope.fromBytes(frame);
+          _lastFrameKind = env.runtimeType.toString();
           switch (env) {
             case ManifestEnvelope():
               // Already handled at the WaitingForSourceScreen step; ignore
@@ -770,10 +785,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               break;
           }
         } catch (e) {
+          _frameError = e.toString();
           if (!completer.isCompleted) completer.completeError(e);
         }
+        if (mounted) setState(() {});
       },
       onError: (Object e) {
+        _frameError = e.toString();
         if (!completer.isCompleted) completer.completeError(e);
       },
       onDone: () {
@@ -926,6 +944,35 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                 child: Text('Working…',
                     style: TextStyle(fontStyle: FontStyle.italic)),
               ),
+            const SizedBox(height: 12),
+            // Diagnostic strip: lets the user see whether frames are
+            // actually arriving on this device. If "frames" stays at 0
+            // while the other phone reports sending, the issue is
+            // delivery (the broadcast stream had no listener at the
+            // moment events fired). If frames are climbing but
+            // _processed isn't, the issue is downstream of the
+            // listener (parse, dedup, write). Removable once the
+            // protocol is stable.
+            DefaultTextStyle.merge(
+              style: const TextStyle(fontSize: 11, color: Colors.black54),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('frames: $_framesSeen'),
+                  const SizedBox(width: 12),
+                  Text('last: $_lastFrameKind'),
+                  if (_frameError != null) ...[
+                    const SizedBox(width: 12),
+                    Flexible(
+                      child: Text(
+                        'err: $_frameError',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
           ],
         ),
       ),
