@@ -108,6 +108,9 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   String _lastFrameKind = '—';
   String? _frameError;
 
+  /// Debug: tracks where in the flow we are.
+  String _flowState = 'init';
+
   @override
   void initState() {
     super.initState();
@@ -166,6 +169,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
+    if (mounted) setState(() => _flowState = 'waiting for Resume');
+
     // Wait for receiver's Resume (confirms listener is attached).
     final resumeCompleter = Completer<void>();
     final sub = session.incomingFrames().listen((frame) {
@@ -192,6 +197,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           'Review screen, then try again.',
         );
       }
+      if (mounted) setState(() => _flowState = 'Resume received, sending');
 
       for (final c in manifest.categories) {
         _phase[c] = _CategoryPhase.queued;
@@ -199,6 +205,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       if (mounted) setState(() {});
 
       await _runSenderInner(session, manifest);
+      if (mounted) setState(() => _flowState = 'all sent');
     } finally {
       await sub.cancel();
     }
@@ -416,6 +423,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     PairedSession session,
     TransferManifest manifest,
   ) async {
+    setState(() => _flowState = 'perms');
+
     // Step 1: Request permissions needed to write data later.
     final neededPermissions = <Permission>{
       for (final c in manifest.categories) ...permissionsFor(c),
@@ -425,6 +434,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         await p.request();
       } catch (_) {}
     }
+    if (mounted) setState(() => _flowState = 'perms done');
 
     // Buffers to collect all incoming records during transfer.
     // Dedup and write happen AFTER TransferDoneEnvelope.
@@ -440,6 +450,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     bool skippingActiveMedia = false;
 
     final completer = Completer<void>();
+    if (mounted) setState(() => _flowState = 'attaching listener');
 
     // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
@@ -569,12 +580,15 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     );
 
     // Tell sender we're ready.
+    if (mounted) setState(() => _flowState = 'sending Resume');
     try {
       await session.sendFrame(ResumeEnvelope(watermarks: const {}).toBytes());
     } catch (_) {}
 
     // Wait for all data to arrive.
+    if (mounted) setState(() => _flowState = 'waiting for data');
     await completer.future;
+    if (mounted) setState(() => _flowState = 'data received');
 
     // Step 4: Dedup and write (receiver only, post-transfer).
     if (mounted) {
@@ -764,21 +778,27 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             // protocol is stable.
             DefaultTextStyle.merge(
               style: const TextStyle(fontSize: 11, color: Colors.black54),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+              child: Column(
                 children: [
-                  Text('frames: $_framesSeen'),
-                  const SizedBox(width: 12),
-                  Text('last: $_lastFrameKind'),
-                  if (_frameError != null) ...[
-                    const SizedBox(width: 12),
-                    Flexible(
-                      child: Text(
-                        'err: $_frameError',
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
+                  Text('state: $_flowState'),
+                  const SizedBox(height: 4),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text('frames: $_framesSeen'),
+                      const SizedBox(width: 12),
+                      Text('last: $_lastFrameKind'),
+                      if (_frameError != null) ...[
+                        const SizedBox(width: 12),
+                        Flexible(
+                          child: Text(
+                            'err: $_frameError',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
                 ],
               ),
             ),
