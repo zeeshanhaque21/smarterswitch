@@ -499,9 +499,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
   /// Pending dedup/write futures for parallel processing.
   final _pendingDedupFutures = <Future<void>>[];
 
-  /// Per-category buffer of incoming records and their IDs.
-  final _receivedIds = <DataCategory, List<String>>{};
-
   Future<void> _runAsReceiver(
     PairedSession session,
     TransferManifest manifest,
@@ -559,6 +556,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final readyCompleter = Completer<void>();
     if (mounted) setState(() => _flowState = 'attaching listener');
 
+    // Periodic UI update timer - avoids setState on every record
+    final uiUpdateTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (mounted) setState(() {});
+    });
+
     // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
       (frame) {
@@ -573,69 +575,52 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             // New protocol: CategoryAnnounce starts a category
             case CategoryAnnounceEnvelope(:final category, :final itemCount):
               activeCategory = category;
-              _receivedIds[category] = [];
               _phase[category] = _CategoryPhase.streaming;
-              if (mounted) setState(() => _flowState = 'receiving $category ($itemCount items)');
-              // Schedule ack in separate event loop iteration to not interfere with socket reads
+              _flowState = 'receiving $category ($itemCount items)';
+              // Schedule ack in separate event loop iteration
               Timer.run(() {
                 session.sendFrame(CategoryAckEnvelope(category: category).toBytes())
                     .catchError((Object _) {});
               });
               break;
 
-            // Write records to disk - use ID from envelope if present
-            case SmsRecordEnvelope(:final record, :final id):
-              // Write JSON line to disk buffer
+            // Write records to disk - minimal processing in listener
+            case SmsRecordEnvelope(:final record):
               smsSink?.writeln(jsonEncode(SmsRecordCodec.toJson(record)));
-              if (id != null) {
-                _receivedIds[DataCategory.sms] ??= [];
-                _receivedIds[DataCategory.sms]!.add(id);
-              }
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
-              if (mounted) setState(() {});
               break;
 
-            case CallLogRecordEnvelope(:final record, :final id):
-              // Write JSON line to disk buffer
+            case CallLogRecordEnvelope(:final record):
               callLogSink?.writeln(jsonEncode(CallLogRecordCodec.toJson(record)));
-              if (id != null) {
-                _receivedIds[DataCategory.callLog] ??= [];
-                _receivedIds[DataCategory.callLog]!.add(id);
-              }
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
-              if (mounted) setState(() {});
               break;
 
             case ContactRecordEnvelope(:final record):
               incomingContacts.add(record);
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
-              if (mounted) setState(() {});
               break;
 
             case CalendarEventEnvelope(:final record):
               incomingCalendar.add(record);
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
-              if (mounted) setState(() {});
               break;
 
             // New protocol: CategorySent ends a category
-            case CategorySentEnvelope(:final category, :final itemIds):
-              final received = _receivedIds[category] ?? [];
-              final missing = itemIds.where((id) => !received.contains(id)).toList();
+            case CategorySentEnvelope(:final category):
+              final count = _processed[category] ?? 0;
               // Schedule confirmation in separate event loop iteration
               Timer.run(() {
                 session.sendFrame(CategoryReceivedEnvelope(
                   category: category,
-                  receivedCount: received.length,
-                  missingIds: missing,
+                  receivedCount: count,
+                  missingIds: const [],
                 ).toBytes()).catchError((Object _) {});
               });
-              // Mark as received (dedup happens after TransferDone)
-              if (mounted) setState(() => _flowState = '$category received');
+              _flowState = '$category received';
               break;
 
             case PhotoHashesEnvelope(:final entries):
@@ -731,7 +716,7 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           _frameError = e.toString();
           if (!completer.isCompleted) completer.completeError(e);
         }
-        if (mounted) setState(() {});
+        // No setState here - handled by periodic timer
       },
       onError: (Object e) {
         _frameError = e.toString();
@@ -745,18 +730,23 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     );
 
     // Tell sender we're ready.
-    if (mounted) setState(() => _flowState = 'sending Resume');
+    _flowState = 'sending Resume';
     try {
       await session.sendFrame(ResumeEnvelope(watermarks: const {}).toBytes());
     } catch (_) {}
 
     // Wait for sender's Ready acknowledgment (handled in main listener).
-    if (mounted) setState(() => _flowState = 'waiting for Ready');
+    _flowState = 'waiting for Ready';
+    if (mounted) setState(() {});
     await readyCompleter.future.timeout(const Duration(seconds: 30)).catchError((_) {});
 
     // Wait for all data to arrive.
-    if (mounted) setState(() => _flowState = 'waiting for data');
+    _flowState = 'waiting for data';
+    if (mounted) setState(() {});
     await completer.future;
+
+    // Stop periodic UI updates
+    uiUpdateTimer.cancel();
     if (mounted) setState(() => _flowState = 'data received');
 
     // Close disk buffer sinks
