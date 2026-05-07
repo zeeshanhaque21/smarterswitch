@@ -238,19 +238,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     throw TimeoutException('Timed out waiting for ${T.toString()}', timeout);
   }
 
-  /// Process any incoming ItemBatchAck envelopes to update progress.
-  void _processIncomingAcks(DataCategory category) {
-    _receiverAcks.removeWhere((env) {
-      if (env is ItemBatchAckEnvelope && env.category == category) {
-        _processed[category] =
-            (_processed[category] ?? 0) + env.receivedIds.length;
-        if (mounted) setState(() {});
-        return true;
-      }
-      return false;
-    });
-  }
-
   Future<void> _runSenderInner(
     PairedSession session,
     TransferManifest manifest,
@@ -292,9 +279,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
           sentIds.add(id);
           await session.sendFrame(encode(r));
           _sent[category] = i + 1;
-
-          // Process any incoming batch acks to update progress
-          _processIncomingAcks(category);
           if (mounted) setState(() {});
         }
       }
@@ -548,12 +532,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     final readyCompleter = Completer<void>();
     if (mounted) setState(() => _flowState = 'attaching listener');
 
-    // Batch ack counter
-    const batchSize = 25;
-
-    // Queue of acks to send - processed outside the listener to avoid blocking
-    final ackQueue = <TransferEnvelope>[];
-
     // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
       (frame) {
@@ -571,73 +549,45 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _receivedIds[category] = [];
               _phase[category] = _CategoryPhase.streaming;
               if (mounted) setState(() => _flowState = 'receiving $category ($itemCount items)');
-              // Queue ack (don't await in listener)
-              ackQueue.add(CategoryAckEnvelope(category: category));
+              // Fire-and-forget ack - MUST not block
+              session.sendFrame(CategoryAckEnvelope(category: category).toBytes())
+                  .catchError((Object _) {});
               break;
 
-            // Buffer records with ID tracking
+            // Buffer records (no per-record acks - just count)
             case SmsRecordEnvelope(:final record):
               incomingSms.add(record);
-              final id = SmsDedup.keyFor(record).toString();
-              _receivedIds[DataCategory.sms]?.add(id);
+              _receivedIds[DataCategory.sms] ??= [];
+              _receivedIds[DataCategory.sms]!.add(SmsDedup.keyFor(record).toString());
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
-              // Queue batch ack every N records
-              if ((_receivedIds[DataCategory.sms]?.length ?? 0) % batchSize == 0) {
-                final ids = _receivedIds[DataCategory.sms]!;
-                ackQueue.add(ItemBatchAckEnvelope(
-                  category: DataCategory.sms,
-                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
-                ));
-              }
               if (mounted) setState(() {});
               break;
 
             case CallLogRecordEnvelope(:final record):
               incomingCallLog.add(record);
-              final id = CallLogDedup.keyFor(record).toString();
-              _receivedIds[DataCategory.callLog]?.add(id);
+              _receivedIds[DataCategory.callLog] ??= [];
+              _receivedIds[DataCategory.callLog]!.add(CallLogDedup.keyFor(record).toString());
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
-              if ((_receivedIds[DataCategory.callLog]?.length ?? 0) % batchSize == 0) {
-                final ids = _receivedIds[DataCategory.callLog]!;
-                ackQueue.add(ItemBatchAckEnvelope(
-                  category: DataCategory.callLog,
-                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
-                ));
-              }
               if (mounted) setState(() {});
               break;
 
             case ContactRecordEnvelope(:final record):
               incomingContacts.add(record);
-              final id = ContactsDedup.matchKeysFor(record).join('|');
-              _receivedIds[DataCategory.contacts]?.add(id);
+              _receivedIds[DataCategory.contacts] ??= [];
+              _receivedIds[DataCategory.contacts]!.add(ContactsDedup.matchKeysFor(record).join('|'));
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
-              if ((_receivedIds[DataCategory.contacts]?.length ?? 0) % batchSize == 0) {
-                final ids = _receivedIds[DataCategory.contacts]!;
-                ackQueue.add(ItemBatchAckEnvelope(
-                  category: DataCategory.contacts,
-                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
-                ));
-              }
               if (mounted) setState(() {});
               break;
 
             case CalendarEventEnvelope(:final record):
               incomingCalendar.add(record);
-              final id = CalendarDedup.keyFor(record).toString();
-              _receivedIds[DataCategory.calendar]?.add(id);
+              _receivedIds[DataCategory.calendar] ??= [];
+              _receivedIds[DataCategory.calendar]!.add(CalendarDedup.keyFor(record).toString());
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
-              if ((_receivedIds[DataCategory.calendar]?.length ?? 0) % batchSize == 0) {
-                final ids = _receivedIds[DataCategory.calendar]!;
-                ackQueue.add(ItemBatchAckEnvelope(
-                  category: DataCategory.calendar,
-                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
-                ));
-              }
               if (mounted) setState(() {});
               break;
 
@@ -645,12 +595,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             case CategorySentEnvelope(:final category, :final itemIds):
               final received = _receivedIds[category] ?? [];
               final missing = itemIds.where((id) => !received.contains(id)).toList();
-              // Queue confirmation
-              ackQueue.add(CategoryReceivedEnvelope(
+              // Fire-and-forget confirmation
+              session.sendFrame(CategoryReceivedEnvelope(
                 category: category,
                 receivedCount: received.length,
                 missingIds: missing,
-              ));
+              ).toBytes()).catchError((Object _) {});
               _phase[category] = _CategoryPhase.done;
               if (mounted) setState(() => _flowState = '$category done, deduping in background');
               // Start background dedup/write for this category
@@ -772,27 +722,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       },
     );
 
-    // Background task to drain ack queue without blocking the listener
-    final ackSender = () async {
-      while (!completer.isCompleted) {
-        if (ackQueue.isNotEmpty) {
-          final ack = ackQueue.removeAt(0);
-          try {
-            await session.sendFrame(ack.toBytes());
-          } catch (_) {}
-        } else {
-          await Future<void>.delayed(const Duration(milliseconds: 10));
-        }
-      }
-      // Drain any remaining acks
-      while (ackQueue.isNotEmpty) {
-        final ack = ackQueue.removeAt(0);
-        try {
-          await session.sendFrame(ack.toBytes());
-        } catch (_) {}
-      }
-    }();
-
     // Tell sender we're ready.
     if (mounted) setState(() => _flowState = 'sending Resume');
     try {
@@ -807,9 +736,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     if (mounted) setState(() => _flowState = 'waiting for data');
     await completer.future;
     if (mounted) setState(() => _flowState = 'data received');
-
-    // Wait for ack sender to finish
-    await ackSender;
 
     // Wait for all background dedup tasks to complete
     if (mounted) setState(() => _flowState = 'finalizing writes');
