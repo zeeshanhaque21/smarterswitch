@@ -469,11 +469,14 @@ class TransferController extends StateNotifier<TransferProgress> {
     _setFlow('attaching listener');
 
     _incomingSub = _session.incomingFrames().listen(
-      (frame) async {
+      (frame) {
         final frameNum = state.framesSeen + 1;
-        // Yield every 20 frames to prevent ANR
+        // Pause stream, yield, then resume - every 20 frames
         if (frameNum % 20 == 0) {
-          await Future<void>.delayed(Duration.zero);
+          _incomingSub?.pause();
+          Future<void>.delayed(const Duration(milliseconds: 1)).then((_) {
+            _incomingSub?.resume();
+          });
         }
         debugPrint('[RX] Frame $frameNum received (${frame.length} bytes)');
         _update((s) => s.copyWith(framesSeen: s.framesSeen + 1));

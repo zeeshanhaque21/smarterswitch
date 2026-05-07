@@ -1,7 +1,7 @@
 name: smarterswitch
 description: "Phone-migration app that merges with deduplication."
 publish_to: 'none'
-version: 0.19.4+49
+version: 0.19.5+50
 
 environment:
   sdk: ^3.11.4
