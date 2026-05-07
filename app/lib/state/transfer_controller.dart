@@ -700,13 +700,20 @@ class TransferController extends StateNotifier<TransferProgress> {
   }
 
   Future<void> _dedupAndWriteSmsFromDisk(String path) async {
+    debugPrint('[RX] _dedupAndWriteSmsFromDisk: $path');
     final file = File(path);
-    if (!await file.exists()) return;
+    if (!await file.exists()) {
+      debugPrint('[RX] SMS buffer file does not exist!');
+      return;
+    }
 
+    debugPrint('[RX] Reading existing SMS for dedup index...');
     final smsIndex = SmsDedup.indexOf(await SmsReader().readAll());
+    debugPrint('[RX] Existing SMS index size: ${smsIndex.length}');
     final toWrite = <SmsRecord>[];
 
     final lines = await file.readAsLines();
+    debugPrint('[RX] Read ${lines.length} lines from buffer');
     for (final line in lines) {
       if (line.trim().isEmpty) continue;
       try {
@@ -717,23 +724,34 @@ class TransferController extends StateNotifier<TransferProgress> {
         } else {
           toWrite.add(record);
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[RX] SMS parse error: $e');
+      }
     }
+
+    debugPrint('[RX] SMS to write: ${toWrite.length}, skipped: ${state.skipped[DataCategory.sms] ?? 0}');
 
     if (toWrite.isNotEmpty) {
       final reader = SmsReader();
-      final granted =
-          await reader.isDefaultSmsApp() || await reader.requestSmsRole();
+      final isDefault = await reader.isDefaultSmsApp();
+      debugPrint('[RX] Is default SMS app: $isDefault');
+      final granted = isDefault || await reader.requestSmsRole();
+      debugPrint('[RX] SMS role granted: $granted');
       if (granted) {
+        debugPrint('[RX] Writing ${toWrite.length} SMS...');
         final written = await reader.writeAll(toWrite);
+        debugPrint('[RX] SMS written: $written');
         final w = Map<DataCategory, int>.from(state.written);
         w[DataCategory.sms] = (w[DataCategory.sms] ?? 0) + written;
         _update((s) => s.copyWith(written: w));
       } else {
+        debugPrint('[RX] SMS role NOT granted, skipping all');
         final sk = Map<DataCategory, int>.from(state.skipped);
         sk[DataCategory.sms] = (sk[DataCategory.sms] ?? 0) + toWrite.length;
         _update((s) => s.copyWith(skipped: sk));
       }
+    } else {
+      debugPrint('[RX] No SMS to write (all duplicates or empty)');
     }
     _setPhase(DataCategory.sms, CategoryPhase.done);
   }
