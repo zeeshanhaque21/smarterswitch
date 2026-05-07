@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -140,23 +140,28 @@ class TransferController extends StateNotifier<TransferProgress> {
   // ───────────────────────────────────────────────────────────────── Sender
 
   Future<void> _runAsSender() async {
+    debugPrint('[TX] Starting sender');
     _setFlow('waiting for Resume');
 
     final resumeCompleter = Completer<void>();
     final sub = _session.incomingFrames().listen((frame) {
       try {
         final env = TransferEnvelope.fromBytes(frame);
+        debugPrint('[TX] Received: ${env.runtimeType}');
         _onFrame(env.runtimeType.toString());
         _receiverAcks.add(env);
         if (env is ResumeEnvelope && !resumeCompleter.isCompleted) {
+          debugPrint('[TX] Resume received');
           resumeCompleter.complete();
         }
       } catch (e) {
+        debugPrint('[TX] Frame error: $e');
         _onFrame('error', error: e.toString());
       }
     });
 
     try {
+      debugPrint('[TX] Waiting for Resume...');
       try {
         await resumeCompleter.future.timeout(const Duration(seconds: 120));
       } on TimeoutException {
@@ -166,8 +171,10 @@ class TransferController extends StateNotifier<TransferProgress> {
           'Review screen, then try again.',
         );
       }
+      debugPrint('[TX] Sending Ready');
       _setFlow('Resume received, sending Ready');
       await _session.sendFrame(const ReadyEnvelope().toBytes());
+      debugPrint('[TX] Ready sent');
 
       for (final c in _manifest.categories) {
         _setPhase(c, CategoryPhase.queued);
@@ -200,15 +207,18 @@ class TransferController extends StateNotifier<TransferProgress> {
 
   Future<void> _runSenderInner() async {
     for (final category in _manifest.categories) {
+      debugPrint('[TX] Starting category: $category');
       _setPhase(category, CategoryPhase.preparing);
       _setFlow('preparing $category');
 
       final count = _manifest.counts[category] ?? 0;
 
+      debugPrint('[TX] Sending CategoryAnnounce for $category ($count items)');
       await _session.sendFrame(CategoryAnnounceEnvelope(
         category: category,
         itemCount: count,
       ).toBytes());
+      debugPrint('[TX] Waiting for CategoryAck for $category');
       _setFlow('waiting for ack: $category');
 
       await _waitForEnvelope<CategoryAckEnvelope>(
@@ -413,6 +423,7 @@ class TransferController extends StateNotifier<TransferProgress> {
   // ──────────────────────────────────────────────────────────────── Receiver
 
   Future<void> _runAsReceiver() async {
+    debugPrint('[RX] Starting receiver');
     _setFlow('perms');
 
     final neededPermissions = <Permission>{
@@ -423,6 +434,7 @@ class TransferController extends StateNotifier<TransferProgress> {
         await p.request();
       } catch (_) {}
     }
+    debugPrint('[RX] Permissions done');
     _setFlow('perms done');
 
     final cacheDir = (await getTemporaryDirectory()).path;
@@ -453,13 +465,17 @@ class TransferController extends StateNotifier<TransferProgress> {
 
     _onDone = Completer<void>();
     final readyCompleter = Completer<void>();
+    debugPrint('[RX] Attaching listener');
     _setFlow('attaching listener');
 
     _incomingSub = _session.incomingFrames().listen(
       (frame) {
+        final frameNum = state.framesSeen + 1;
+        debugPrint('[RX] Frame $frameNum received (${frame.length} bytes)');
         _update((s) => s.copyWith(framesSeen: s.framesSeen + 1));
         try {
           final env = TransferEnvelope.fromBytes(frame);
+          debugPrint('[RX] Frame $frameNum: ${env.runtimeType}');
           _update((s) => s.copyWith(lastFrameKind: env.runtimeType.toString()));
 
           switch (env) {
@@ -467,17 +483,22 @@ class TransferController extends StateNotifier<TransferProgress> {
               break;
 
             case CategoryAnnounceEnvelope(:final category, :final itemCount):
+              debugPrint('[RX] CategoryAnnounce: $category ($itemCount items)');
               _setPhase(category, CategoryPhase.streaming);
               _setFlow('receiving $category ($itemCount items)');
+              debugPrint('[RX] Sending CategoryAck for $category');
               Timer.run(() {
                 _session
                     .sendFrame(CategoryAckEnvelope(category: category).toBytes())
-                    .catchError((Object _) {});
+                    .then((_) => debugPrint('[RX] CategoryAck sent for $category'))
+                    .catchError((Object e) => debugPrint('[RX] CategoryAck error: $e'));
               });
               break;
 
             case SmsRecordEnvelope(:final record):
+              debugPrint('[RX] SMS record, writing to disk...');
               smsSink?.writeln(jsonEncode(SmsRecordCodec.toJson(record)));
+              debugPrint('[RX] SMS written');
               _incrementProcessed(DataCategory.sms);
               break;
 
@@ -498,6 +519,8 @@ class TransferController extends StateNotifier<TransferProgress> {
 
             case CategorySentEnvelope(:final category):
               final count = state.processed[category] ?? 0;
+              debugPrint('[RX] CategorySent: $category, processed $count');
+              debugPrint('[RX] Sending CategoryReceived for $category');
               Timer.run(() {
                 _session
                     .sendFrame(CategoryReceivedEnvelope(
@@ -505,7 +528,8 @@ class TransferController extends StateNotifier<TransferProgress> {
                       receivedCount: count,
                       missingIds: const [],
                     ).toBytes())
-                    .catchError((Object _) {});
+                    .then((_) => debugPrint('[RX] CategoryReceived sent for $category'))
+                    .catchError((Object e) => debugPrint('[RX] CategoryReceived error: $e'));
               });
               _setFlow('$category received');
               break;
@@ -576,6 +600,7 @@ class TransferController extends StateNotifier<TransferProgress> {
               break;
 
             case TransferDoneEnvelope():
+              debugPrint('[RX] TransferDone received!');
               if (!_onDone!.isCompleted) _onDone!.complete();
               break;
 
@@ -611,29 +636,40 @@ class TransferController extends StateNotifier<TransferProgress> {
       },
     );
 
+    debugPrint('[RX] Sending Resume');
     _setFlow('sending Resume');
     try {
       await _session.sendFrame(ResumeEnvelope(watermarks: const {}).toBytes());
-    } catch (_) {}
+      debugPrint('[RX] Resume sent');
+    } catch (e) {
+      debugPrint('[RX] Resume send error: $e');
+    }
 
+    debugPrint('[RX] Waiting for Ready');
     _setFlow('waiting for Ready');
     await readyCompleter.future
         .timeout(const Duration(seconds: 30))
-        .catchError((_) {});
+        .catchError((e) => debugPrint('[RX] Ready timeout: $e'));
+    debugPrint('[RX] Ready received (or timeout)');
 
+    debugPrint('[RX] Waiting for data...');
     _setFlow('waiting for data');
     await _onDone!.future;
 
+    debugPrint('[RX] Data received, closing sinks');
     _setFlow('data received');
 
     await smsSink?.close();
     await callLogSink?.close();
+    debugPrint('[RX] Sinks closed');
 
+    debugPrint('[RX] Processing SMS from disk');
     _setFlow('processing SMS');
     if (_manifest.categories.contains(DataCategory.sms) &&
         await smsFile.exists()) {
       await _dedupAndWriteSmsFromDisk(smsBufferPath);
       await smsFile.delete();
+      debugPrint('[RX] SMS processing complete');
     }
 
     _setFlow('processing Call Log');
