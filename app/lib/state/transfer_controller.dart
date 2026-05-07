@@ -772,8 +772,8 @@ class TransferController extends StateNotifier<TransferProgress> {
   }
 }
 
-final transferControllerProvider = StateNotifierProvider.family
-    .autoDispose<TransferController, TransferProgress, TransferParams>(
+final transferControllerProvider =
+    StateNotifierProvider.family<TransferController, TransferProgress, TransferParams>(
   (ref, params) => TransferController(
     params.session,
     params.manifest,
