@@ -549,9 +549,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _receivedIds[category] = [];
               _phase[category] = _CategoryPhase.streaming;
               if (mounted) setState(() => _flowState = 'receiving $category ($itemCount items)');
-              // Fire-and-forget ack - MUST not block
-              session.sendFrame(CategoryAckEnvelope(category: category).toBytes())
-                  .catchError((Object _) {});
+              // Schedule ack in separate event loop iteration to not interfere with socket reads
+              Timer.run(() {
+                session.sendFrame(CategoryAckEnvelope(category: category).toBytes())
+                    .catchError((Object _) {});
+              });
               break;
 
             // Buffer records (no per-record acks - just count)
@@ -595,12 +597,14 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             case CategorySentEnvelope(:final category, :final itemIds):
               final received = _receivedIds[category] ?? [];
               final missing = itemIds.where((id) => !received.contains(id)).toList();
-              // Fire-and-forget confirmation
-              session.sendFrame(CategoryReceivedEnvelope(
-                category: category,
-                receivedCount: received.length,
-                missingIds: missing,
-              ).toBytes()).catchError((Object _) {});
+              // Schedule confirmation in separate event loop iteration
+              Timer.run(() {
+                session.sendFrame(CategoryReceivedEnvelope(
+                  category: category,
+                  receivedCount: received.length,
+                  missingIds: missing,
+                ).toBytes()).catchError((Object _) {});
+              });
               _phase[category] = _CategoryPhase.done;
               if (mounted) setState(() => _flowState = '$category done, deduping in background');
               // Start background dedup/write for this category
@@ -625,9 +629,11 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   skip.add(e.sha256);
                 }
               }
-              session
-                  .sendFrame(PhotoSkipListEnvelope(skip: skip).toBytes())
-                  .catchError((Object _) {});
+              // Schedule in separate event loop iteration
+              Timer.run(() {
+                session.sendFrame(PhotoSkipListEnvelope(skip: skip).toBytes())
+                    .catchError((Object _) {});
+              });
               if (mounted) setState(() {});
               break;
             case PhotoSkipListEnvelope():
