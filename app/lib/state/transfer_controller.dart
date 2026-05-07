@@ -137,6 +137,18 @@ class TransferController extends StateNotifier<TransferProgress> {
         ));
   }
 
+  /// Send a progress ack every 10 items so sender can mirror receiver progress.
+  void _maybeSendProgressAck(DataCategory category) {
+    final count = state.processed[category] ?? 0;
+    if (count % 10 == 0) {
+      Timer.run(() {
+        _session
+            .sendFrame(RecordAckEnvelope(category: category, count: count).toBytes())
+            .catchError((Object _) {});
+      });
+    }
+  }
+
   // ───────────────────────────────────────────────────────────────── Sender
 
   Future<void> _runAsSender() async {
@@ -153,6 +165,12 @@ class TransferController extends StateNotifier<TransferProgress> {
         if (env is ResumeEnvelope && !resumeCompleter.isCompleted) {
           debugPrint('[TX] Resume received');
           resumeCompleter.complete();
+        }
+        // Update sender progress to mirror receiver progress
+        if (env is RecordAckEnvelope) {
+          final processed = Map<DataCategory, int>.from(state.processed);
+          processed[env.category] = env.count;
+          _update((s) => s.copyWith(processed: processed));
         }
       } catch (e) {
         debugPrint('[TX] Frame error: $e');
@@ -529,21 +547,25 @@ class TransferController extends StateNotifier<TransferProgress> {
               smsSink?.writeln(jsonEncode(SmsRecordCodec.toJson(record)));
               debugPrint('[RX] SMS written');
               _incrementProcessed(DataCategory.sms);
+              _maybeSendProgressAck(DataCategory.sms);
               break;
 
             case CallLogRecordEnvelope(:final record):
               callLogSink?.writeln(jsonEncode(CallLogRecordCodec.toJson(record)));
               _incrementProcessed(DataCategory.callLog);
+              _maybeSendProgressAck(DataCategory.callLog);
               break;
 
             case ContactRecordEnvelope(:final record):
               incomingContacts.add(record);
               _incrementProcessed(DataCategory.contacts);
+              _maybeSendProgressAck(DataCategory.contacts);
               break;
 
             case CalendarEventEnvelope(:final record):
               incomingCalendar.add(record);
               _incrementProcessed(DataCategory.calendar);
+              _maybeSendProgressAck(DataCategory.calendar);
               break;
 
             case CategorySentEnvelope(:final category):

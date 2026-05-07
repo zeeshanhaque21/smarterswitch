@@ -101,15 +101,22 @@ class _PairScreenState extends ConsumerState<PairScreen> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      // If the user just hit "Start over" from a downstream screen, a
-      // PairedSession (with its heartbeat timer + bound socket) and any
-      // backing transport advert may still be alive. Without tearing
-      // them down here, the next pair attempt's advertise / accept
-      // can fail with EADDRINUSE or surface a duplicate mDNS name,
-      // which presents as the OLD phone's "Looking for the new
-      // phone…" hanging.
-      final prior = ref.read(transferStateProvider).pairedSession;
+      // Check if we already have an active session - if so, skip pairing
+      final tState = ref.read(transferStateProvider);
+      final prior = tState.pairedSession;
       if (prior != null) {
+        // Session exists - check if it's still alive by the role
+        final role = tState.role;
+        if (role == DeviceRole.sender) {
+          // Sender goes to select screen
+          if (mounted) context.go('/select');
+          return;
+        } else if (role == DeviceRole.receiver) {
+          // Receiver goes to waiting screen
+          if (mounted) context.go('/waiting');
+          return;
+        }
+        // If role is unset but session exists, clean it up
         try {
           await prior.close();
         } catch (_) {}
