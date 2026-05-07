@@ -440,6 +440,8 @@ class TransferController extends StateNotifier<TransferProgress> {
     // Request SMS role BEFORE transfer if SMS is being transferred
     if (_manifest.categories.contains(DataCategory.sms)) {
       final smsReader = SmsReader();
+      final currentDefault = await smsReader.getDefaultSmsPackage();
+      debugPrint('[RX] Current default SMS package: $currentDefault');
       final isDefault = await smsReader.isDefaultSmsApp();
       debugPrint('[RX] Is default SMS app (pre-check): $isDefault');
       if (!isDefault) {
@@ -450,7 +452,8 @@ class TransferController extends StateNotifier<TransferProgress> {
         if (!granted) {
           throw StateError(
             'SmarterSwitch must be your default SMS app to receive messages. '
-            'Please tap "Allow" when prompted, then try again.',
+            'Current default is: $currentDefault. '
+            'Please set SmarterSwitch as default in Settings → Apps → Default apps → SMS app, then try again.',
           );
         }
       }
