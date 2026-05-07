@@ -89,10 +89,12 @@ sealed class TransferEnvelope {
       case 'call_log_record':
         return CallLogRecordEnvelope(
           CallLogRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
+          id: raw['id'] as String?,
         );
       case 'sms_record':
         return SmsRecordEnvelope(
           SmsRecordCodec.fromJson(raw['record'] as Map<String, dynamic>),
+          id: raw['id'] as String?,
         );
       case 'media_start':
         return MediaStartEnvelope(
@@ -219,22 +221,26 @@ class ManifestEnvelope extends TransferEnvelope {
 }
 
 class CallLogRecordEnvelope extends TransferEnvelope {
-  CallLogRecordEnvelope(this.record);
+  CallLogRecordEnvelope(this.record, {this.id});
   final CallLogRecord record;
+  final String? id;
   @override
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'call_log_record',
         'record': CallLogRecordCodec.toJson(record),
+        if (id != null) 'id': id,
       })));
 }
 
 class SmsRecordEnvelope extends TransferEnvelope {
-  SmsRecordEnvelope(this.record);
+  SmsRecordEnvelope(this.record, {this.id});
   final SmsRecord record;
+  final String? id;
   @override
   Uint8List toBytes() => Uint8List.fromList(utf8.encode(jsonEncode({
         'kind': 'sms_record',
         'record': SmsRecordCodec.toJson(record),
+        if (id != null) 'id': id,
       })));
 }
 

@@ -287,14 +287,20 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
         case DataCategory.sms:
           await streamWithIds<SmsRecord>(
             () => SmsReader().readAll(),
-            (r) => SmsRecordEnvelope(r).toBytes(),
+            (r) {
+              final id = SmsDedup.keyFor(r).toString();
+              return SmsRecordEnvelope(r, id: id).toBytes();
+            },
             (r) => SmsDedup.keyFor(r).toString(),
           );
           break;
         case DataCategory.callLog:
           await streamWithIds<CallLogRecord>(
             () => CallLogReader().readAll(),
-            (r) => CallLogRecordEnvelope(r).toBytes(),
+            (r) {
+              final id = CallLogDedup.keyFor(r).toString();
+              return CallLogRecordEnvelope(r, id: id).toBytes();
+            },
             (r) => CallLogDedup.keyFor(r).toString(),
           );
           break;
@@ -556,20 +562,24 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               });
               break;
 
-            // Buffer records (no per-record acks - just count)
-            case SmsRecordEnvelope(:final record):
+            // Buffer records - use ID from envelope if present
+            case SmsRecordEnvelope(:final record, :final id):
               incomingSms.add(record);
-              _receivedIds[DataCategory.sms] ??= [];
-              _receivedIds[DataCategory.sms]!.add(SmsDedup.keyFor(record).toString());
+              if (id != null) {
+                _receivedIds[DataCategory.sms] ??= [];
+                _receivedIds[DataCategory.sms]!.add(id);
+              }
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
               if (mounted) setState(() {});
               break;
 
-            case CallLogRecordEnvelope(:final record):
+            case CallLogRecordEnvelope(:final record, :final id):
               incomingCallLog.add(record);
-              _receivedIds[DataCategory.callLog] ??= [];
-              _receivedIds[DataCategory.callLog]!.add(CallLogDedup.keyFor(record).toString());
+              if (id != null) {
+                _receivedIds[DataCategory.callLog] ??= [];
+                _receivedIds[DataCategory.callLog]!.add(id);
+              }
               _processed[DataCategory.callLog] =
                   (_processed[DataCategory.callLog] ?? 0) + 1;
               if (mounted) setState(() {});
@@ -577,8 +587,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
             case ContactRecordEnvelope(:final record):
               incomingContacts.add(record);
-              _receivedIds[DataCategory.contacts] ??= [];
-              _receivedIds[DataCategory.contacts]!.add(ContactsDedup.matchKeysFor(record).join('|'));
               _processed[DataCategory.contacts] =
                   (_processed[DataCategory.contacts] ?? 0) + 1;
               if (mounted) setState(() {});
@@ -586,8 +594,6 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
 
             case CalendarEventEnvelope(:final record):
               incomingCalendar.add(record);
-              _receivedIds[DataCategory.calendar] ??= [];
-              _receivedIds[DataCategory.calendar]!.add(CalendarDedup.keyFor(record).toString());
               _processed[DataCategory.calendar] =
                   (_processed[DataCategory.calendar] ?? 0) + 1;
               if (mounted) setState(() {});
