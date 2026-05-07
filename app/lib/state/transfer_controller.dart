@@ -437,6 +437,25 @@ class TransferController extends StateNotifier<TransferProgress> {
     debugPrint('[RX] Permissions done');
     _setFlow('perms done');
 
+    // Request SMS role BEFORE transfer if SMS is being transferred
+    if (_manifest.categories.contains(DataCategory.sms)) {
+      final smsReader = SmsReader();
+      final isDefault = await smsReader.isDefaultSmsApp();
+      debugPrint('[RX] Is default SMS app (pre-check): $isDefault');
+      if (!isDefault) {
+        _setFlow('requesting SMS role');
+        debugPrint('[RX] Requesting SMS role...');
+        final granted = await smsReader.requestSmsRole();
+        debugPrint('[RX] SMS role granted (pre-transfer): $granted');
+        if (!granted) {
+          throw StateError(
+            'SmarterSwitch must be your default SMS app to receive messages. '
+            'Please tap "Allow" when prompted, then try again.',
+          );
+        }
+      }
+    }
+
     final cacheDir = (await getTemporaryDirectory()).path;
     final smsBufferPath = '$cacheDir/transfer_sms_buffer.jsonl';
     final callLogBufferPath = '$cacheDir/transfer_calllog_buffer.jsonl';
