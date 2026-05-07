@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -518,9 +519,29 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     }
     if (mounted) setState(() => _flowState = 'perms done');
 
-    // Buffers to collect all incoming records during transfer.
-    final incomingSms = <SmsRecord>[];
-    final incomingCallLog = <CallLogRecord>[];
+    // Disk-backed buffers for SMS and Call Log to avoid memory overflow.
+    // Records are written as JSON lines and read back after transfer.
+    final cacheDir = (await getTemporaryDirectory()).path;
+    final smsBufferPath = '$cacheDir/transfer_sms_buffer.jsonl';
+    final callLogBufferPath = '$cacheDir/transfer_calllog_buffer.jsonl';
+
+    // Delete any stale buffers from previous failed transfers
+    final smsFile = File(smsBufferPath);
+    final callLogFile = File(callLogBufferPath);
+    if (await smsFile.exists()) await smsFile.delete();
+    if (await callLogFile.exists()) await callLogFile.delete();
+
+    // Open files for append-mode writing
+    IOSink? smsSink;
+    IOSink? callLogSink;
+    if (manifest.categories.contains(DataCategory.sms)) {
+      smsSink = smsFile.openWrite(mode: FileMode.append);
+    }
+    if (manifest.categories.contains(DataCategory.callLog)) {
+      callLogSink = callLogFile.openWrite(mode: FileMode.append);
+    }
+
+    // Contacts and Calendar still use memory buffers (usually smaller)
     final incomingContacts = <Contact>[];
     final incomingCalendar = <CalendarEvent>[];
 
@@ -562,9 +583,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               });
               break;
 
-            // Buffer records - use ID from envelope if present
+            // Write records to disk - use ID from envelope if present
             case SmsRecordEnvelope(:final record, :final id):
-              incomingSms.add(record);
+              // Write JSON line to disk buffer
+              smsSink?.writeln(jsonEncode(SmsRecordCodec.toJson(record)));
               if (id != null) {
                 _receivedIds[DataCategory.sms] ??= [];
                 _receivedIds[DataCategory.sms]!.add(id);
@@ -575,7 +597,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               break;
 
             case CallLogRecordEnvelope(:final record, :final id):
-              incomingCallLog.add(record);
+              // Write JSON line to disk buffer
+              callLogSink?.writeln(jsonEncode(CallLogRecordCodec.toJson(record)));
               if (id != null) {
                 _receivedIds[DataCategory.callLog] ??= [];
                 _receivedIds[DataCategory.callLog]!.add(id);
@@ -611,21 +634,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   missingIds: missing,
                 ).toBytes()).catchError((Object _) {});
               });
-              _phase[category] = _CategoryPhase.done;
-              if (mounted) setState(() => _flowState = '$category done, deduping in background');
-              // Start background dedup/write for this category
-              _pendingDedupFutures.add(_dedupAndWriteCategory(
-                category,
-                incomingSms: List.of(incomingSms),
-                incomingCallLog: List.of(incomingCallLog),
-                incomingContacts: List.of(incomingContacts),
-                incomingCalendar: List.of(incomingCalendar),
-              ));
-              // Clear buffers for next category
-              if (category == DataCategory.sms) incomingSms.clear();
-              if (category == DataCategory.callLog) incomingCallLog.clear();
-              if (category == DataCategory.contacts) incomingContacts.clear();
-              if (category == DataCategory.calendar) incomingCalendar.clear();
+              // Mark as received (dedup happens after TransferDone)
+              if (mounted) setState(() => _flowState = '$category received');
               break;
 
             case PhotoHashesEnvelope(:final entries):
@@ -749,121 +759,169 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     await completer.future;
     if (mounted) setState(() => _flowState = 'data received');
 
-    // Wait for all background dedup tasks to complete
+    // Close disk buffer sinks
+    await smsSink?.close();
+    await callLogSink?.close();
+
+    // Read records from disk and process
+    if (mounted) setState(() => _flowState = 'processing SMS');
+    if (manifest.categories.contains(DataCategory.sms) && await smsFile.exists()) {
+      await _dedupAndWriteSmsFromDisk(smsBufferPath);
+      await smsFile.delete();
+    }
+
+    if (mounted) setState(() => _flowState = 'processing Call Log');
+    if (manifest.categories.contains(DataCategory.callLog) && await callLogFile.exists()) {
+      await _dedupAndWriteCallLogFromDisk(callLogBufferPath);
+      await callLogFile.delete();
+    }
+
+    // Contacts and Calendar still use memory-based processing
+    if (mounted) setState(() => _flowState = 'processing Contacts');
+    if (incomingContacts.isNotEmpty) {
+      await _dedupAndWriteContacts(incomingContacts);
+    }
+
+    if (mounted) setState(() => _flowState = 'processing Calendar');
+    if (incomingCalendar.isNotEmpty) {
+      await _dedupAndWriteCalendar(incomingCalendar);
+    }
+
+    // Wait for any background dedup tasks (photos)
     if (mounted) setState(() => _flowState = 'finalizing writes');
     await Future.wait(_pendingDedupFutures);
     if (mounted) setState(() => _flowState = 'all done');
   }
 
-  /// Background dedup and write for a single category.
-  Future<void> _dedupAndWriteCategory(
-    DataCategory category, {
-    required List<SmsRecord> incomingSms,
-    required List<CallLogRecord> incomingCallLog,
-    required List<Contact> incomingContacts,
-    required List<CalendarEvent> incomingCalendar,
-  }) async {
-    switch (category) {
-      case DataCategory.sms:
-        if (incomingSms.isEmpty) return;
-        final smsIndex = SmsDedup.indexOf(await SmsReader().readAll());
-        final toWrite = <SmsRecord>[];
-        for (final r in incomingSms) {
-          if (SmsDedup.isDuplicate(smsIndex, r)) {
-            _skippedByCategory[DataCategory.sms] =
-                (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
-          } else {
-            toWrite.add(r);
-          }
-        }
-        if (toWrite.isNotEmpty) {
-          final reader = SmsReader();
-          final granted =
-              await reader.isDefaultSmsApp() || await reader.requestSmsRole();
-          if (granted) {
-            final written = await reader.writeAll(toWrite);
-            _writtenByCategory[DataCategory.sms] =
-                (_writtenByCategory[DataCategory.sms] ?? 0) + written;
-          } else {
-            _skippedByCategory[DataCategory.sms] =
-                (_skippedByCategory[DataCategory.sms] ?? 0) + toWrite.length;
-          }
-        }
-        if (mounted) setState(() {});
-        break;
+  /// Read SMS records from disk, dedup, and write.
+  Future<void> _dedupAndWriteSmsFromDisk(String path) async {
+    final file = File(path);
+    if (!await file.exists()) return;
 
-      case DataCategory.callLog:
-        if (incomingCallLog.isEmpty) return;
-        final callLogIndex = CallLogDedup.indexOf(await CallLogReader().readAll());
-        final toWrite = <CallLogRecord>[];
-        for (final r in incomingCallLog) {
-          if (CallLogDedup.isDuplicate(callLogIndex, r)) {
-            _skippedByCategory[DataCategory.callLog] =
-                (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
-          } else {
-            toWrite.add(r);
-          }
-        }
-        if (toWrite.isNotEmpty) {
-          final written = await CallLogReader().writeAll(toWrite);
-          _writtenByCategory[DataCategory.callLog] =
-              (_writtenByCategory[DataCategory.callLog] ?? 0) + written;
-        }
-        if (mounted) setState(() {});
-        break;
+    // Build dedup index from local SMS
+    final smsIndex = SmsDedup.indexOf(await SmsReader().readAll());
+    final toWrite = <SmsRecord>[];
 
-      case DataCategory.contacts:
-        if (incomingContacts.isEmpty) return;
-        final contactsKeys = <Set<String>>[
-          for (final c in await ContactsReader().readAll())
-            ContactsDedup.matchKeysFor(c),
-        ];
-        final toWrite = <Contact>[];
-        for (final r in incomingContacts) {
-          final keys = ContactsDedup.matchKeysFor(r);
-          final isDup = keys.isNotEmpty &&
-              contactsKeys.any(
-                  (existing) => existing.intersection(keys).length == keys.length);
-          if (isDup) {
-            _skippedByCategory[DataCategory.contacts] =
-                (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
-          } else {
-            toWrite.add(r);
-          }
+    // Read line by line to avoid loading all into memory
+    final lines = await file.readAsLines();
+    for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final json = jsonDecode(line) as Map<String, dynamic>;
+        final record = SmsRecordCodec.fromJson(json);
+        if (SmsDedup.isDuplicate(smsIndex, record)) {
+          _skippedByCategory[DataCategory.sms] =
+              (_skippedByCategory[DataCategory.sms] ?? 0) + 1;
+        } else {
+          toWrite.add(record);
         }
-        if (toWrite.isNotEmpty) {
-          final written = await ContactsReader().writeAll(toWrite);
-          _writtenByCategory[DataCategory.contacts] =
-              (_writtenByCategory[DataCategory.contacts] ?? 0) + written;
-        }
-        if (mounted) setState(() {});
-        break;
-
-      case DataCategory.calendar:
-        if (incomingCalendar.isEmpty) return;
-        final calendarIndex = CalendarDedup.indexOf(await CalendarReader().readAll());
-        final toWrite = <CalendarEvent>[];
-        for (final r in incomingCalendar) {
-          if (CalendarDedup.isDuplicate(calendarIndex, r)) {
-            _skippedByCategory[DataCategory.calendar] =
-                (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
-          } else {
-            toWrite.add(r);
-          }
-        }
-        if (toWrite.isNotEmpty) {
-          final written = await CalendarReader().writeAll(toWrite);
-          _writtenByCategory[DataCategory.calendar] =
-              (_writtenByCategory[DataCategory.calendar] ?? 0) + written;
-        }
-        if (mounted) setState(() {});
-        break;
-
-      case DataCategory.photos:
-        // Photos use streaming write, handled inline
-        break;
+      } catch (_) {
+        // Skip malformed lines
+      }
     }
+
+    if (toWrite.isNotEmpty) {
+      final reader = SmsReader();
+      final granted =
+          await reader.isDefaultSmsApp() || await reader.requestSmsRole();
+      if (granted) {
+        final written = await reader.writeAll(toWrite);
+        _writtenByCategory[DataCategory.sms] =
+            (_writtenByCategory[DataCategory.sms] ?? 0) + written;
+      } else {
+        _skippedByCategory[DataCategory.sms] =
+            (_skippedByCategory[DataCategory.sms] ?? 0) + toWrite.length;
+      }
+    }
+    _phase[DataCategory.sms] = _CategoryPhase.done;
+    if (mounted) setState(() {});
   }
+
+  /// Read Call Log records from disk, dedup, and write.
+  Future<void> _dedupAndWriteCallLogFromDisk(String path) async {
+    final file = File(path);
+    if (!await file.exists()) return;
+
+    // Build dedup index from local call log
+    final callLogIndex = CallLogDedup.indexOf(await CallLogReader().readAll());
+    final toWrite = <CallLogRecord>[];
+
+    // Read line by line
+    final lines = await file.readAsLines();
+    for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final json = jsonDecode(line) as Map<String, dynamic>;
+        final record = CallLogRecordCodec.fromJson(json);
+        if (CallLogDedup.isDuplicate(callLogIndex, record)) {
+          _skippedByCategory[DataCategory.callLog] =
+              (_skippedByCategory[DataCategory.callLog] ?? 0) + 1;
+        } else {
+          toWrite.add(record);
+        }
+      } catch (_) {
+        // Skip malformed lines
+      }
+    }
+
+    if (toWrite.isNotEmpty) {
+      final written = await CallLogReader().writeAll(toWrite);
+      _writtenByCategory[DataCategory.callLog] =
+          (_writtenByCategory[DataCategory.callLog] ?? 0) + written;
+    }
+    _phase[DataCategory.callLog] = _CategoryPhase.done;
+    if (mounted) setState(() {});
+  }
+
+  /// Dedup and write contacts (memory-based, usually small).
+  Future<void> _dedupAndWriteContacts(List<Contact> incoming) async {
+    final contactsKeys = <Set<String>>[
+      for (final c in await ContactsReader().readAll())
+        ContactsDedup.matchKeysFor(c),
+    ];
+    final toWrite = <Contact>[];
+    for (final r in incoming) {
+      final keys = ContactsDedup.matchKeysFor(r);
+      final isDup = keys.isNotEmpty &&
+          contactsKeys.any(
+              (existing) => existing.intersection(keys).length == keys.length);
+      if (isDup) {
+        _skippedByCategory[DataCategory.contacts] =
+            (_skippedByCategory[DataCategory.contacts] ?? 0) + 1;
+      } else {
+        toWrite.add(r);
+      }
+    }
+    if (toWrite.isNotEmpty) {
+      final written = await ContactsReader().writeAll(toWrite);
+      _writtenByCategory[DataCategory.contacts] =
+          (_writtenByCategory[DataCategory.contacts] ?? 0) + written;
+    }
+    _phase[DataCategory.contacts] = _CategoryPhase.done;
+    if (mounted) setState(() {});
+  }
+
+  /// Dedup and write calendar events (memory-based, usually small).
+  Future<void> _dedupAndWriteCalendar(List<CalendarEvent> incoming) async {
+    final calendarIndex = CalendarDedup.indexOf(await CalendarReader().readAll());
+    final toWrite = <CalendarEvent>[];
+    for (final r in incoming) {
+      if (CalendarDedup.isDuplicate(calendarIndex, r)) {
+        _skippedByCategory[DataCategory.calendar] =
+            (_skippedByCategory[DataCategory.calendar] ?? 0) + 1;
+      } else {
+        toWrite.add(r);
+      }
+    }
+    if (toWrite.isNotEmpty) {
+      final written = await CalendarReader().writeAll(toWrite);
+      _writtenByCategory[DataCategory.calendar] =
+          (_writtenByCategory[DataCategory.calendar] ?? 0) + written;
+    }
+    _phase[DataCategory.calendar] = _CategoryPhase.done;
+    if (mounted) setState(() {});
+  }
+
 
   // ----------------------------------------------------------------- Render
 
