@@ -92,11 +92,27 @@ object SmsChannel {
             PackageManager.PERMISSION_GRANTED
 
     private fun isDefault(context: Context): Boolean {
-        return Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val rm = context.getSystemService(RoleManager::class.java)
+            rm?.isRoleHeld(RoleManager.ROLE_SMS) == true
+        } else {
+            Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
+        }
     }
 
-    private fun currentDefault(context: Context): String? =
-        Telephony.Sms.getDefaultSmsPackage(context)
+    private fun currentDefault(context: Context): String? {
+        // On Q+, getDefaultSmsPackage may return null even when role is held
+        val pkg = Telephony.Sms.getDefaultSmsPackage(context)
+        if (pkg != null) return pkg
+        // Fallback: if we hold the role, report ourselves
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val rm = context.getSystemService(RoleManager::class.java)
+            if (rm?.isRoleHeld(RoleManager.ROLE_SMS) == true) {
+                return context.packageName
+            }
+        }
+        return null
+    }
 
     private fun handleCount(
         activity: Activity,
