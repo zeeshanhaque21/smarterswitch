@@ -92,7 +92,6 @@ class TransferController extends StateNotifier<TransferProgress> {
   }
 
   void _update(TransferProgress Function(TransferProgress) updater) {
-    if (!mounted) return;
     state = updater(state);
   }
 
