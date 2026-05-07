@@ -551,9 +551,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     // Batch ack counter
     const batchSize = 25;
 
+    // Queue of acks to send - processed outside the listener to avoid blocking
+    final ackQueue = <TransferEnvelope>[];
+
     // Step 2: Attach listener and tell sender we're ready.
     _incomingSub = session.incomingFrames().listen(
-      (frame) async {
+      (frame) {
         _framesSeen += 1;
         try {
           final env = TransferEnvelope.fromBytes(frame);
@@ -568,8 +571,8 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _receivedIds[category] = [];
               _phase[category] = _CategoryPhase.streaming;
               if (mounted) setState(() => _flowState = 'receiving $category ($itemCount items)');
-              // Ack the category
-              await session.sendFrame(CategoryAckEnvelope(category: category).toBytes());
+              // Queue ack (don't await in listener)
+              ackQueue.add(CategoryAckEnvelope(category: category));
               break;
 
             // Buffer records with ID tracking
@@ -579,13 +582,13 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
               _receivedIds[DataCategory.sms]?.add(id);
               _processed[DataCategory.sms] =
                   (_processed[DataCategory.sms] ?? 0) + 1;
-              // Send batch ack every N records
+              // Queue batch ack every N records
               if ((_receivedIds[DataCategory.sms]?.length ?? 0) % batchSize == 0) {
                 final ids = _receivedIds[DataCategory.sms]!;
-                await session.sendFrame(ItemBatchAckEnvelope(
+                ackQueue.add(ItemBatchAckEnvelope(
                   category: DataCategory.sms,
-                  receivedIds: ids.sublist(ids.length - batchSize),
-                ).toBytes());
+                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
+                ));
               }
               if (mounted) setState(() {});
               break;
@@ -598,10 +601,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   (_processed[DataCategory.callLog] ?? 0) + 1;
               if ((_receivedIds[DataCategory.callLog]?.length ?? 0) % batchSize == 0) {
                 final ids = _receivedIds[DataCategory.callLog]!;
-                await session.sendFrame(ItemBatchAckEnvelope(
+                ackQueue.add(ItemBatchAckEnvelope(
                   category: DataCategory.callLog,
-                  receivedIds: ids.sublist(ids.length - batchSize),
-                ).toBytes());
+                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
+                ));
               }
               if (mounted) setState(() {});
               break;
@@ -614,10 +617,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   (_processed[DataCategory.contacts] ?? 0) + 1;
               if ((_receivedIds[DataCategory.contacts]?.length ?? 0) % batchSize == 0) {
                 final ids = _receivedIds[DataCategory.contacts]!;
-                await session.sendFrame(ItemBatchAckEnvelope(
+                ackQueue.add(ItemBatchAckEnvelope(
                   category: DataCategory.contacts,
-                  receivedIds: ids.sublist(ids.length - batchSize),
-                ).toBytes());
+                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
+                ));
               }
               if (mounted) setState(() {});
               break;
@@ -630,10 +633,10 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
                   (_processed[DataCategory.calendar] ?? 0) + 1;
               if ((_receivedIds[DataCategory.calendar]?.length ?? 0) % batchSize == 0) {
                 final ids = _receivedIds[DataCategory.calendar]!;
-                await session.sendFrame(ItemBatchAckEnvelope(
+                ackQueue.add(ItemBatchAckEnvelope(
                   category: DataCategory.calendar,
-                  receivedIds: ids.sublist(ids.length - batchSize),
-                ).toBytes());
+                  receivedIds: ids.sublist(ids.length - batchSize).toList(),
+                ));
               }
               if (mounted) setState(() {});
               break;
@@ -642,12 +645,12 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
             case CategorySentEnvelope(:final category, :final itemIds):
               final received = _receivedIds[category] ?? [];
               final missing = itemIds.where((id) => !received.contains(id)).toList();
-              // Send confirmation
-              await session.sendFrame(CategoryReceivedEnvelope(
+              // Queue confirmation
+              ackQueue.add(CategoryReceivedEnvelope(
                 category: category,
                 receivedCount: received.length,
                 missingIds: missing,
-              ).toBytes());
+              ));
               _phase[category] = _CategoryPhase.done;
               if (mounted) setState(() => _flowState = '$category done, deduping in background');
               // Start background dedup/write for this category
@@ -769,6 +772,27 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
       },
     );
 
+    // Background task to drain ack queue without blocking the listener
+    final ackSender = () async {
+      while (!completer.isCompleted) {
+        if (ackQueue.isNotEmpty) {
+          final ack = ackQueue.removeAt(0);
+          try {
+            await session.sendFrame(ack.toBytes());
+          } catch (_) {}
+        } else {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      }
+      // Drain any remaining acks
+      while (ackQueue.isNotEmpty) {
+        final ack = ackQueue.removeAt(0);
+        try {
+          await session.sendFrame(ack.toBytes());
+        } catch (_) {}
+      }
+    }();
+
     // Tell sender we're ready.
     if (mounted) setState(() => _flowState = 'sending Resume');
     try {
@@ -783,6 +807,9 @@ class _TransferScreenState extends ConsumerState<TransferScreen> {
     if (mounted) setState(() => _flowState = 'waiting for data');
     await completer.future;
     if (mounted) setState(() => _flowState = 'data received');
+
+    // Wait for ack sender to finish
+    await ackSender;
 
     // Wait for all background dedup tasks to complete
     if (mounted) setState(() => _flowState = 'finalizing writes');
